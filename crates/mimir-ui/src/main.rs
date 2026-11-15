@@ -5,7 +5,13 @@ use eframe::egui;
 use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
-use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, Utterance};
+use mimir_core::calendar::{
+    CalendarEvent, open_url_in_system_browser, parse_ics, upcoming_or_active_events,
+};
+use mimir_core::{
+    ActionItem, AudioRetention, ChannelId, KeywordPreset, MimirConfig, SUMMARY_TEMPLATES, Session,
+    Utterance,
+};
 use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
 use mimir_store::cleanup::{
     basic_heuristic_cleanup, build_qwen_cleanup_prompt_with_context, sanitize_cleanup_edit,
@@ -13,6 +19,7 @@ use mimir_store::cleanup::{
 use mimir_store::{
     SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir,
     export::{TranscriptView, render_markdown_with_view},
+    sync_session_to_drop_dir_if_enabled,
 };
 use mimir_whistle::artifact::{
     delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model,
@@ -39,6 +46,9 @@ enum UiEvent {
     Status(String),
     CleanupProgress(usize, usize),
     CleanupDone,
+    SummarizeProgress(usize, usize),
+    SummarizeDone,
+    CalendarEvents(Vec<CalendarEvent>),
     SessionFinished,
     UpdateResult(UpdateStatus),
 }
@@ -49,6 +59,8 @@ struct MimirDesktopApp {
     mini_mode: bool,
     session_title: String,
     keywords_input: String,
+    preset_name_input: String,
+    selected_preset_name: Option<String>,
     diarize_mic: bool,
     save_wav: bool,
     encrypt_at_rest: bool,
@@ -63,6 +75,10 @@ struct MimirDesktopApp {
     selected_title_edit: String,
     confirm_delete_id: Option<Uuid>,
     selected_markdown: String,
+    selected_summary: Option<String>,
+    selected_action_items: Vec<ActionItem>,
+    selected_summary_template: String,
+    show_summary_panel: bool,
     transcript_view: TranscriptView,
     search_query: String,
     search_results: Vec<SearchHit>,
@@ -70,6 +86,10 @@ struct MimirDesktopApp {
     speaker_label_edit: String,
     status_line: String,
     cleanup_progress: Option<(usize, usize)>,
+    summarize_progress: Option<(usize, usize)>,
+    calendar_events: Vec<CalendarEvent>,
+    calendar_ics_input: String,
+    pending_calendar_meta: Option<(String, Option<String>, Vec<String>)>,
     connect_report: String,
     update_line: String,
     event_tx: mpsc::Sender<UiEvent>,
@@ -83,12 +103,15 @@ impl MimirDesktopApp {
         let (event_tx, event_rx) = mpsc::channel();
         let save_wav = matches!(cfg.audio_retention, AudioRetention::ArchiveWav);
         let encrypt_at_rest = cfg.encrypt_at_rest;
+        let default_template = cfg.default_summary_template.clone();
         let mut app = Self {
             cfg,
             tab: Tab::Live,
             mini_mode: false,
             session_title: String::new(),
             keywords_input: String::new(),
+            preset_name_input: String::new(),
+            selected_preset_name: None,
             diarize_mic: false,
             save_wav,
             encrypt_at_rest,
@@ -103,6 +126,10 @@ impl MimirDesktopApp {
             selected_title_edit: String::new(),
             confirm_delete_id: None,
             selected_markdown: String::new(),
+            selected_summary: None,
+            selected_action_items: Vec::new(),
+            selected_summary_template: default_template,
+            show_summary_panel: false,
             transcript_view: TranscriptView::Cleaned,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -110,12 +137,17 @@ impl MimirDesktopApp {
             speaker_label_edit: String::new(),
             status_line: "Ready — 100% Local • Whistle AI • Zero Telemetry".to_string(),
             cleanup_progress: None,
+            summarize_progress: None,
+            calendar_events: Vec::new(),
+            calendar_ics_input: String::new(),
+            pending_calendar_meta: None,
             connect_report: String::new(),
             update_line: String::new(),
             event_tx,
             event_rx,
         };
         app.refresh_sessions();
+        app.refresh_calendar_events();
         app
     }
 
@@ -133,6 +165,8 @@ impl MimirDesktopApp {
                     self.selected_session_id = None;
                     self.selected_markdown.clear();
                     self.selected_title_edit.clear();
+                    self.selected_summary = None;
+                    self.selected_action_items.clear();
                 }
             } else if let Some(first) = self.sessions.first() {
                 self.load_session(first.id);
@@ -150,6 +184,15 @@ impl MimirDesktopApp {
             && let Ok(Some(session)) = store.get_session(id)
         {
             self.selected_markdown = render_markdown_with_view(&session, self.transcript_view);
+            self.selected_summary = session.summary_markdown.clone();
+            if let Some(tmpl) = session.summary_template.clone() {
+                self.selected_summary_template = tmpl;
+            }
+            self.selected_action_items = session
+                .action_items_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<ActionItem>>(raw).ok())
+                .unwrap_or_default();
         }
     }
 
@@ -238,12 +281,20 @@ impl MimirDesktopApp {
         let mic_level = self.mic_level.clone();
         let sys_level = self.sys_level.clone();
         let tx_ui = self.event_tx.clone();
+        let cal_meta = self.pending_calendar_meta.take();
 
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let engine = WhistleEngine::load(&lib_path, &weights_path)?;
                 let store = SessionStore::open(&cfg.data_dir)?;
                 let mut session = Session::new(title, keywords.clone());
+                if let Some((uid, url, attendees)) = cal_meta {
+                    session.calendar_event_uid = Some(uid);
+                    session.meeting_url = url;
+                    if !attendees.is_empty() {
+                        session.attendees_json = serde_json::to_string(&attendees).ok();
+                    }
+                }
                 store.create_session(&session)?;
 
                 let (audio_tx, audio_rx) = mpsc::channel();
@@ -402,6 +453,24 @@ impl MimirDesktopApp {
                     Utc::now(),
                     &langs.into_iter().collect::<Vec<_>>(),
                 );
+                if cfg.auto_summarize {
+                    let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg);
+                    if qwen_w.is_file() && qwen_t.is_file() {
+                        let _ = tx_ui.send(UiEvent::Status("Auto-summarizing with Qwen 2.5 0.5B…".into()));
+                        if let Ok(mut qwen) = QwenCleanupModel::load(&qwen_w, &qwen_t) {
+                            let _ = store.summarize_session_with_progress(
+                                session.id,
+                                &cfg.default_summary_template,
+                                |sys, usr, max_tok| qwen.complete(sys, usr, max_tok),
+                                |done, total| {
+                                    let _ = tx_ui.send(UiEvent::SummarizeProgress(done, total));
+                                },
+                            );
+                            let _ = tx_ui.send(UiEvent::SummarizeDone);
+                        }
+                    }
+                }
+                let _ = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg);
                 Ok(())
             })();
 
@@ -420,6 +489,64 @@ impl MimirDesktopApp {
         self.sys_level.store(0.0f32.to_bits(), Ordering::Relaxed);
         self.is_recording = false;
         self.status_line = "Stopping & saving session…".into();
+    }
+
+    fn refresh_calendar_events(&self) {
+        let sources = self.cfg.calendar_ics_urls.clone();
+        if sources.is_empty() {
+            return;
+        }
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            for src in sources {
+                let trimmed = src.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let content = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    ureq::get(trimmed)
+                        .call()
+                        .ok()
+                        .and_then(|mut r| r.body_mut().read_to_string().ok())
+                } else {
+                    std::fs::read_to_string(trimmed).ok()
+                };
+                if let Some(ics) = content {
+                    all.extend(parse_ics(&ics, trimmed));
+                }
+            }
+            let upcoming = upcoming_or_active_events(&all, Utc::now().timestamp(), 900);
+            let _ = tx.send(UiEvent::CalendarEvents(upcoming));
+        });
+    }
+
+    fn join_and_record_event(&mut self, ev: &CalendarEvent, open_url: bool) {
+        if open_url
+            && let Some(ref url) = ev.meeting_url
+            && let Err(e) = open_url_in_system_browser(url)
+        {
+            self.status_line = format!("Failed to open meeting URL: {e}");
+        }
+        self.session_title = ev.title.clone();
+        let mut kw_parts: Vec<String> = self
+            .keywords_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for att in &ev.attendees {
+            if !kw_parts.iter().any(|k| k.eq_ignore_ascii_case(att)) {
+                kw_parts.push(att.clone());
+            }
+        }
+        self.keywords_input = kw_parts.join(", ");
+        self.pending_calendar_meta = Some((
+            ev.uid.clone(),
+            ev.meeting_url.clone(),
+            ev.attendees.clone(),
+        ));
+        self.start_recording();
     }
 
     fn run_search(&mut self) {
@@ -465,6 +592,20 @@ impl MimirDesktopApp {
                     if let Some(sid) = self.selected_session_id {
                         self.load_session(sid);
                     }
+                }
+                UiEvent::SummarizeProgress(done, total) => {
+                    self.summarize_progress = Some((done, total));
+                }
+                UiEvent::SummarizeDone => {
+                    self.summarize_progress = None;
+                    self.show_summary_panel = true;
+                    self.refresh_sessions();
+                    if let Some(sid) = self.selected_session_id {
+                        self.load_session(sid);
+                    }
+                }
+                UiEvent::CalendarEvents(events) => {
+                    self.calendar_events = events;
                 }
                 UiEvent::SessionFinished => {
                     self.is_recording = false;
@@ -644,6 +785,41 @@ impl eframe::App for MimirDesktopApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Live => {
+                if !self.is_recording && !self.calendar_events.is_empty() {
+                    let events_snapshot = self.calendar_events.clone();
+                    let now_ts = Utc::now().timestamp();
+                    if let Some(ev) = events_snapshot.first() {
+                        let mins = ((ev.start_ts - now_ts) as f64 / 60.0).round() as i64;
+                        let timing = if ev.start_ts <= now_ts && now_ts <= ev.end_ts {
+                            "Ongoing now".to_string()
+                        } else if mins >= 0 {
+                            format!("Starts in {mins} min")
+                        } else {
+                            format!("Started {} min ago", -mins)
+                        };
+                        egui::Frame::new()
+                            .fill(active_bg)
+                            .stroke(egui::Stroke::new(1.0, cyan))
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new("UPCOMING MEETING").monospace().size(10.0).color(ice));
+                                    ui.label(egui::RichText::new(&ev.title).strong().color(text_primary));
+                                    ui.label(egui::RichText::new(format!("· {timing} · {} attendee(s)", ev.attendees.len())).color(text_muted));
+                                    if ev.meeting_url.is_some()
+                                        && ui.button(egui::RichText::new("Join & Record").strong().color(ice)).clicked()
+                                    {
+                                        self.join_and_record_event(ev, true);
+                                    }
+                                    if ui.button("Record Only").clicked() {
+                                        self.join_and_record_event(ev, false);
+                                    }
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.add_enabled(
                         !self.is_recording,
@@ -666,6 +842,71 @@ impl eframe::App for MimirDesktopApp {
                         }
                     }
                 });
+                if !self.mini_mode {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Preset:").size(11.5).color(text_muted));
+                        let selected_lbl = self
+                            .selected_preset_name
+                            .as_deref()
+                            .unwrap_or("Select preset…");
+                        egui::ComboBox::from_id_salt("kw_preset_combo")
+                            .selected_text(selected_lbl)
+                            .show_ui(ui, |ui| {
+                                let presets = self.cfg.keyword_presets.clone();
+                                for p in presets {
+                                    let is_sel = self.selected_preset_name.as_deref() == Some(&p.name);
+                                    if ui.selectable_label(is_sel, &p.name).clicked() {
+                                        self.selected_preset_name = Some(p.name.clone());
+                                        self.preset_name_input = p.name.clone();
+                                        self.keywords_input = p.keywords.join(", ");
+                                    }
+                                }
+                            });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.preset_name_input)
+                                .desired_width(110.0)
+                                .hint_text("Preset name"),
+                        );
+                        if ui.button("Save Preset").clicked() {
+                            let name = self.preset_name_input.trim().to_string();
+                            let kws: Vec<String> = self
+                                .keywords_input
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            if !name.is_empty() {
+                                if let Some(existing) = self
+                                    .cfg
+                                    .keyword_presets
+                                    .iter_mut()
+                                    .find(|p| p.name.eq_ignore_ascii_case(&name))
+                                {
+                                    existing.keywords = kws;
+                                } else {
+                                    self.cfg.keyword_presets.push(KeywordPreset {
+                                        name: name.clone(),
+                                        keywords: kws,
+                                    });
+                                }
+                                self.selected_preset_name = Some(name.clone());
+                                let _ = self.cfg.save();
+                                self.status_line = format!("Saved keyword preset '{name}'.");
+                            }
+                        }
+                        if let Some(sel_name) = self.selected_preset_name.clone()
+                            && ui.button("Delete Preset").clicked()
+                        {
+                            self.cfg
+                                .keyword_presets
+                                .retain(|p| !p.name.eq_ignore_ascii_case(&sel_name));
+                            self.selected_preset_name = None;
+                            let _ = self.cfg.save();
+                            self.status_line = format!("Deleted keyword preset '{sel_name}'.");
+                        }
+                    });
+                }
                 ui.add_space(8.0);
                 egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                     if self.live_lines.is_empty() {
@@ -849,10 +1090,63 @@ impl eframe::App for MimirDesktopApp {
                             (TranscriptView::Raw, "Raw"),
                             (TranscriptView::Diff, "Diff"),
                         ] {
-                            if ui.selectable_label(self.transcript_view == view, lbl).clicked() {
+                            if ui.selectable_label(!self.show_summary_panel && self.transcript_view == view, lbl).clicked() {
+                                self.show_summary_panel = false;
                                 self.transcript_view = view;
                                 self.load_session(sel_id);
                             }
+                        }
+                        if ui.selectable_label(self.show_summary_panel, "Summary").clicked() {
+                            self.show_summary_panel = true;
+                        }
+                        egui::ComboBox::from_id_salt("summary_tmpl_combo")
+                            .selected_text(&self.selected_summary_template)
+                            .show_ui(ui, |ui| {
+                                for tmpl in SUMMARY_TEMPLATES {
+                                    ui.selectable_value(
+                                        &mut self.selected_summary_template,
+                                        tmpl.to_string(),
+                                        tmpl,
+                                    );
+                                }
+                            });
+                        if ui.button("Summarize").clicked() {
+                            let cfg_clone = self.cfg.clone();
+                            let tmpl = self.selected_summary_template.clone();
+                            let tx = self.event_tx.clone();
+                            self.status_line = "Summarizing session with Qwen 2.5 0.5B…".into();
+                            self.summarize_progress = Some((0, 0));
+                            std::thread::spawn(move || {
+                                let res: anyhow::Result<String> = (|| {
+                                    let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg_clone);
+                                    anyhow::ensure!(
+                                        qwen_w.is_file() && qwen_t.is_file(),
+                                        "Qwen 2.5 0.5B not installed — fetch it in Assistants tab"
+                                    );
+                                    let store = SessionStore::open(&cfg_clone.data_dir)?;
+                                    let mut qwen = QwenCleanupModel::load(&qwen_w, &qwen_t)?;
+                                    let out = store.summarize_session_with_progress(
+                                        sel_id,
+                                        &tmpl,
+                                        |sys, usr, max_tok| qwen.complete(sys, usr, max_tok),
+                                        |done, total| {
+                                            let _ = tx.send(UiEvent::SummarizeProgress(done, total));
+                                        },
+                                    )?;
+                                    let _ = sync_session_to_drop_dir_if_enabled(&store, sel_id, &cfg_clone);
+                                    Ok(format!(
+                                        "Summarized ({}, {} action item(s))",
+                                        out.summary_template,
+                                        out.action_items.len()
+                                    ))
+                                })();
+                                let msg = match res {
+                                    Ok(s) => s,
+                                    Err(e) => format!("Summary error: {e}"),
+                                };
+                                let _ = tx.send(UiEvent::SummarizeDone);
+                                let _ = tx.send(UiEvent::Status(msg));
+                            });
                         }
                     });
                     if let Some((done, total)) = self.cleanup_progress {
@@ -863,6 +1157,20 @@ impl eframe::App for MimirDesktopApp {
                         };
                         let label = if total > 0 {
                             format!("Cleaning {done} / {total} utterances…")
+                        } else {
+                            "Loading Qwen 2.5 0.5B…".to_string()
+                        };
+                        ui.add(egui::ProgressBar::new(frac).text(label).animate(total == 0));
+                        ui.ctx().request_repaint();
+                    }
+                    if let Some((done, total)) = self.summarize_progress {
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let label = if total > 0 {
+                            format!("Summarizing step {done} / {total}…")
                         } else {
                             "Loading Qwen 2.5 0.5B…".to_string()
                         };
@@ -894,7 +1202,37 @@ impl eframe::App for MimirDesktopApp {
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("sess_md").show(ui, |ui| {
-                            if self.selected_markdown.is_empty() {
+                            if self.show_summary_panel {
+                                if let Some(ref summary) = self.selected_summary {
+                                    ui.label(egui::RichText::new("SUMMARY").monospace().size(11.0).color(ice));
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new(summary).color(text_primary));
+                                } else {
+                                    ui.label(egui::RichText::new("No summary generated yet — click Summarize above.").color(text_muted));
+                                }
+                                if !self.selected_action_items.is_empty() {
+                                    ui.add_space(10.0);
+                                    ui.label(egui::RichText::new("ACTION ITEMS").monospace().size(11.0).color(cyan));
+                                    ui.add_space(4.0);
+                                    for item in &self.selected_action_items {
+                                        let owner = item.owner.as_deref().unwrap_or("Unassigned");
+                                        let due = item
+                                            .due_hint
+                                            .as_deref()
+                                            .map(|d| format!(" (due: {d})"))
+                                            .unwrap_or_default();
+                                        let ts = item
+                                            .timestamp
+                                            .as_deref()
+                                            .map(|t| format!(" [{t}]"))
+                                            .unwrap_or_default();
+                                        ui.label(
+                                            egui::RichText::new(format!("• [{owner}] {}{due}{ts}", item.task))
+                                                .color(text_primary),
+                                        );
+                                    }
+                                }
+                            } else if self.selected_markdown.is_empty() {
                                 ui.label(egui::RichText::new("Select a session from the left rail to view its Markdown.").color(text_muted));
                             } else {
                                 ui.monospace(&self.selected_markdown);
@@ -903,6 +1241,56 @@ impl eframe::App for MimirDesktopApp {
                     });
             }
             Tab::Assistants => {
+                egui::Frame::new()
+                    .fill(card_bg)
+                    .stroke(egui::Stroke::new(1.0, hairline))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("AUTOMATION & CALENDAR").monospace().size(11.0).color(text_muted));
+                        ui.add_space(6.0);
+                        if ui.checkbox(&mut self.cfg.auto_summarize, "Auto-summarize after recording (Qwen 2.5 0.5B)").changed() {
+                            let _ = self.cfg.save();
+                        }
+                        if ui.checkbox(&mut self.cfg.drop_sync_enabled, "Sync exports to Drop Folder on stop / cleanup / summarize").changed() {
+                            let _ = self.cfg.save();
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.calendar_ics_input)
+                                    .desired_width(300.0)
+                                    .hint_text("https://...ics or /path/to/calendar.ics"),
+                            );
+                            if ui.button("Add .ics").clicked() {
+                                let trimmed = self.calendar_ics_input.trim().to_string();
+                                if !trimmed.is_empty() && !self.cfg.calendar_ics_urls.contains(&trimmed) {
+                                    self.cfg.calendar_ics_urls.push(trimmed);
+                                    self.calendar_ics_input.clear();
+                                    let _ = self.cfg.save();
+                                    self.refresh_calendar_events();
+                                }
+                            }
+                            if ui.button("Refresh Calendar").clicked() {
+                                self.refresh_calendar_events();
+                            }
+                        });
+                        let mut remove_idx = None;
+                        for (idx, url) in self.cfg.calendar_ics_urls.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.monospace(url);
+                                if ui.small_button("Remove").clicked() {
+                                    remove_idx = Some(idx);
+                                }
+                            });
+                        }
+                        if let Some(idx) = remove_idx {
+                            self.cfg.calendar_ics_urls.remove(idx);
+                            let _ = self.cfg.save();
+                            self.refresh_calendar_events();
+                        }
+                    });
+                ui.add_space(10.0);
                 egui::Frame::new()
                     .fill(card_bg)
                     .stroke(egui::Stroke::new(1.0, hairline))

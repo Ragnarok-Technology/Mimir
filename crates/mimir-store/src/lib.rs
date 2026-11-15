@@ -2,11 +2,12 @@
 
 pub mod cleanup;
 pub mod export;
+pub mod summarize;
 
 use chrono::{DateTime, Utc};
 use mimir_core::{
-    ChannelId, MimirError, Result, Session, SpeakerInfo, TranscriptFormat, Utterance, WordToken,
-    restrict_file_permissions,
+    ChannelId, MimirConfig, MimirError, Result, Session, SpeakerInfo, TranscriptFormat, Utterance,
+    WordToken, restrict_file_permissions,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -77,7 +78,13 @@ impl SessionStore {
                 ended_at TEXT,
                 languages_json TEXT NOT NULL DEFAULT '[]',
                 keywords_json TEXT NOT NULL DEFAULT '[]',
-                archived INTEGER NOT NULL DEFAULT 0
+                archived INTEGER NOT NULL DEFAULT 0,
+                summary_markdown TEXT,
+                summary_template TEXT,
+                action_items_json TEXT,
+                calendar_event_uid TEXT,
+                meeting_url TEXT,
+                attendees_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS speakers (
@@ -132,6 +139,17 @@ impl SessionStore {
             "ALTER TABLE utterances ADD COLUMN raw_text TEXT",
             [],
         );
+        for col in [
+            "summary_markdown TEXT",
+            "summary_template TEXT",
+            "action_items_json TEXT",
+            "calendar_event_uid TEXT",
+            "meeting_url TEXT",
+            "attendees_json TEXT",
+        ] {
+            let sql = format!("ALTER TABLE sessions ADD COLUMN {col}");
+            let _ = conn.execute(&sql, []);
+        }
 
         Ok(Self { conn, sessions_dir })
     }
@@ -145,8 +163,12 @@ impl SessionStore {
 
         self.conn
             .execute(
-                "INSERT INTO sessions (id, title, started_at, ended_at, languages_json, keywords_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO sessions (
+                    id, title, started_at, ended_at, languages_json, keywords_json,
+                    summary_markdown, summary_template, action_items_json,
+                    calendar_event_uid, meeting_url, attendees_json
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     session.id.to_string(),
                     session.title,
@@ -154,6 +176,12 @@ impl SessionStore {
                     session.ended_at.map(|d| d.to_rfc3339()),
                     langs,
                     kws,
+                    session.summary_markdown,
+                    session.summary_template,
+                    session.action_items_json,
+                    session.calendar_event_uid,
+                    session.meeting_url,
+                    session.attendees_json,
                 ],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
@@ -541,20 +569,229 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// Updates a session's summary markdown, template, and extracted action items JSON.
+    pub fn update_session_summary(
+        &self,
+        session_id: Uuid,
+        summary_markdown: Option<&str>,
+        summary_template: Option<&str>,
+        action_items_json: Option<&str>,
+    ) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE sessions
+                 SET summary_markdown = ?1, summary_template = ?2, action_items_json = ?3
+                 WHERE id = ?4",
+                params![
+                    summary_markdown,
+                    summary_template,
+                    action_items_json,
+                    session_id.to_string()
+                ],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Updates calendar metadata attached to a session.
+    pub fn update_session_calendar_meta(
+        &self,
+        session_id: Uuid,
+        calendar_event_uid: Option<&str>,
+        meeting_url: Option<&str>,
+        attendees_json: Option<&str>,
+    ) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE sessions
+                 SET calendar_event_uid = ?1, meeting_url = ?2, attendees_json = ?3
+                 WHERE id = ?4",
+                params![
+                    calendar_event_uid,
+                    meeting_url,
+                    attendees_json,
+                    session_id.to_string()
+                ],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Runs local map-reduce summarization, action-item extraction, and conditional auto-titling
+    /// using the provided `complete(system, user, max_new_tokens)` callback (e.g. `QwenCleanupModel::complete`).
+    pub fn summarize_session_with_progress<F, P>(
+        &self,
+        session_id: Uuid,
+        template: &str,
+        mut complete: F,
+        mut on_progress: P,
+    ) -> Result<summarize::SessionSummaryResult>
+    where
+        F: FnMut(&str, &str, usize) -> Result<String>,
+        P: FnMut(usize, usize),
+    {
+        let Some(session) = self.get_session(session_id)? else {
+            return Err(MimirError::Storage(format!("session {session_id} not found")));
+        };
+
+        let norm_template = summarize::normalize_template_name(template).to_string();
+        let lines = summarize::format_transcript_lines(&session);
+        if lines.is_empty() {
+            let empty_json = "[]".to_string();
+            self.update_session_summary(
+                session_id,
+                Some("No spoken utterances recorded in this session."),
+                Some(&norm_template),
+                Some(&empty_json),
+            )?;
+            on_progress(1, 1);
+            return Ok(summarize::SessionSummaryResult {
+                summary_markdown: "No spoken utterances recorded in this session.".to_string(),
+                summary_template: norm_template,
+                action_items: Vec::new(),
+                action_items_json: empty_json,
+                auto_title: None,
+            });
+        }
+
+        let chunks = summarize::chunk_transcript_lines(&lines, summarize::DEFAULT_SUMMARY_CHUNK_CHARS);
+        let map_steps = if chunks.len() > 1 { chunks.len() } else { 0 };
+        let needs_title = summarize::is_default_or_timestamped_title(session.title.as_deref());
+        let total_steps = map_steps + 2 + usize::from(needs_title);
+        let mut done = 0usize;
+        on_progress(done, total_steps);
+
+        let combined_notes = if chunks.len() > 1 {
+            let mut partials = Vec::with_capacity(chunks.len());
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let (sys, usr) = summarize::build_chunk_map_prompt(chunk, idx, chunks.len());
+                let note = complete(&sys, &usr, 220)?;
+                if !note.trim().is_empty() {
+                    partials.push(note.trim().to_string());
+                }
+                done += 1;
+                on_progress(done, total_steps);
+            }
+            partials.join("\n\n")
+        } else {
+            chunks[0].clone()
+        };
+
+        let context_hint = session.title.as_deref().filter(|t| !summarize::is_default_or_timestamped_title(Some(t)));
+        let (sum_sys, sum_usr) =
+            summarize::build_summary_reduce_prompt(&combined_notes, &norm_template, context_hint);
+        let summary_markdown = complete(&sum_sys, &sum_usr, 420)?.trim().to_string();
+        done += 1;
+        on_progress(done, total_steps);
+
+        let speaker_labels: Vec<String> = session
+            .speakers
+            .values()
+            .map(|s| s.label.clone())
+            .collect();
+        let (act_sys, act_usr) = summarize::build_action_items_prompt(&combined_notes, &speaker_labels);
+        let raw_actions = complete(&act_sys, &act_usr, 320)?;
+        let action_items = summarize::parse_action_items_response(&raw_actions);
+        let action_items_json = serde_json::to_string(&action_items)
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        done += 1;
+        on_progress(done, total_steps);
+
+        let auto_title = if needs_title {
+            let title_input = if summary_markdown.is_empty() {
+                combined_notes.as_str()
+            } else {
+                summary_markdown.as_str()
+            };
+            let (title_sys, title_usr) = summarize::build_auto_title_prompt(title_input);
+            let raw_title = complete(&title_sys, &title_usr, 32)?;
+            let sanitized = summarize::sanitize_auto_title(&raw_title);
+            if let Some(ref t) = sanitized {
+                let _ = self.rename_session(session_id, t);
+            }
+            done += 1;
+            on_progress(done, total_steps);
+            sanitized
+        } else {
+            None
+        };
+
+        self.update_session_summary(
+            session_id,
+            Some(&summary_markdown),
+            Some(&norm_template),
+            Some(&action_items_json),
+        )?;
+
+        Ok(summarize::SessionSummaryResult {
+            summary_markdown,
+            summary_template: norm_template,
+            action_items,
+            action_items_json,
+            auto_title,
+        })
+    }
+
     /// Loads a full `Session` (including speakers and chronologically ordered utterances).
     pub fn get_session(&self, session_id: Uuid) -> Result<Option<Session>> {
-        let row: Option<(String, Option<String>, String, Option<String>, String, String)> = self
+        let row: Option<(
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = self
             .conn
             .query_row(
-                "SELECT id, title, started_at, ended_at, languages_json, keywords_json
+                "SELECT id, title, started_at, ended_at, languages_json, keywords_json,
+                        summary_markdown, summary_template, action_items_json,
+                        calendar_event_uid, meeting_url, attendees_json
                  FROM sessions WHERE id = ?1",
                 params![session_id.to_string()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| MimirError::Storage(e.to_string()))?;
 
-        let Some((id_str, title, started_str, ended_str, langs_json, kws_json)) = row else {
+        let Some((
+            id_str,
+            title,
+            started_str,
+            ended_str,
+            langs_json,
+            kws_json,
+            summary_markdown,
+            summary_template,
+            action_items_json,
+            calendar_event_uid,
+            meeting_url,
+            attendees_json,
+        )) = row
+        else {
             return Ok(None);
         };
 
@@ -655,6 +892,12 @@ impl SessionStore {
             keywords_used: serde_json::from_str(&kws_json).unwrap_or_default(),
             speakers,
             utterances,
+            summary_markdown,
+            summary_template,
+            action_items_json,
+            calendar_event_uid,
+            meeting_url,
+            attendees_json,
         }))
     }
 
@@ -736,6 +979,25 @@ pub fn sync_to_drop_dir(session: &Session, drop_dir: &Path) -> Result<(PathBuf, 
     atomic_write(&jsonl_path, jsonl_content.as_bytes())?;
 
     Ok((md_path, jsonl_path))
+}
+
+/// Syncs `session_id` to `cfg.drop_dir` when `cfg.drop_sync_enabled` is true and `drop_dir` is set.
+pub fn sync_session_to_drop_dir_if_enabled(
+    store: &SessionStore,
+    session_id: Uuid,
+    cfg: &MimirConfig,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    if !cfg.drop_sync_enabled {
+        return Ok(None);
+    }
+    let Some(drop_dir) = cfg.drop_dir.as_deref() else {
+        return Ok(None);
+    };
+    let Some(session) = store.get_session(session_id)? else {
+        return Ok(None);
+    };
+    let paths = sync_to_drop_dir(&session, drop_dir)?;
+    Ok(Some(paths))
 }
 
 fn atomic_write(dest: &Path, data: &[u8]) -> Result<()> {
@@ -835,6 +1097,69 @@ mod tests {
         let last = enc.len() - 1;
         enc[last] ^= 0xFF;
         assert!(decrypt_bytes_at_rest(dir.path(), &enc).is_err());
+    }
+
+    #[test]
+    fn summarize_session_persists_summary_actions_autotitle_and_exports() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+
+        let mut session = Session::new(None, vec!["Mimir".into()]);
+        session.calendar_event_uid = Some("cal-evt-42".into());
+        session.meeting_url = Some("https://meet.google.com/abc-defg-hij".into());
+        session.attendees_json = Some(r#"["Host","Alice"]"#.into());
+        store.create_session(&session).unwrap();
+
+        let u1 = sample_utterance(ChannelId::Mic, "host", 1000, "We should ship local Qwen summaries this week.");
+        let u2 = sample_utterance(ChannelId::System, "host", 4000, "I will update the SQLite schema by Friday.");
+        store.append_utterance(session.id, &u1).unwrap();
+        store.append_utterance(session.id, &u2).unwrap();
+
+        let mut progress_calls = Vec::new();
+        let res = store
+            .summarize_session_with_progress(
+                session.id,
+                "technical_review",
+                |sys, _usr, _max| {
+                    if sys.contains("JSON array") {
+                        Ok(r#"[{"owner":"Host","task":"Update SQLite schema","due_hint":"Friday","timestamp":"00:00:04"}]"#.into())
+                    } else if sys.contains("3 to 7 word") {
+                        Ok("Local Qwen Summary Review".into())
+                    } else {
+                        Ok("### Key Decisions\n- Ship local Qwen summaries this week.".into())
+                    }
+                },
+                |done, total| progress_calls.push((done, total)),
+            )
+            .unwrap();
+
+        assert_eq!(res.summary_template, "technical_review");
+        assert_eq!(res.auto_title.as_deref(), Some("Local Qwen Summary Review"));
+        assert_eq!(res.action_items.len(), 1);
+        assert_eq!(progress_calls.last(), Some(&(3, 3)));
+
+        let loaded = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Local Qwen Summary Review"));
+        assert_eq!(loaded.calendar_event_uid.as_deref(), Some("cal-evt-42"));
+        assert_eq!(
+            loaded.meeting_url.as_deref(),
+            Some("https://meet.google.com/abc-defg-hij")
+        );
+        assert!(loaded.summary_markdown.as_deref().unwrap().contains("Key Decisions"));
+
+        let md = export::render_session(&loaded, TranscriptFormat::Markdown).unwrap();
+        assert!(md.contains("## Summary (technical_review)"));
+        assert!(md.contains("## Action Items"));
+        assert!(md.contains("**Host:** Update SQLite schema (due: Friday, @ 00:00:04)"));
+        assert!(md.contains("**Meeting URL:** https://meet.google.com/abc-defg-hij"));
+
+        let mut cfg = MimirConfig::default();
+        cfg.drop_sync_enabled = true;
+        cfg.drop_dir = Some(dir.path().join("drop_sync"));
+        let synced = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg).unwrap();
+        assert!(synced.is_some());
+        let (md_path, _) = synced.unwrap();
+        assert!(std::fs::read_to_string(md_path).unwrap().contains("## Summary (technical_review)"));
     }
 }
 

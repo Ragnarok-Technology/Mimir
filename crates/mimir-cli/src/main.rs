@@ -113,6 +113,23 @@ enum Commands {
         #[arg(long)]
         progress: bool,
     },
+    /// Generate a local Qwen 2.5 0.5B summary, action items, and auto-title for a session.
+    Summarize {
+        session_id: Uuid,
+        /// Summary template (`general`, `1on1`, `standup`, `sales_discovery`, `technical_review`).
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Emit machine-readable `PROGRESS:<done>:<total>` lines to stderr as steps finish.
+        #[arg(long)]
+        progress: bool,
+    },
+    /// List, save, or delete named keyword biasing presets.
+    Presets {
+        #[command(subcommand)]
+        action: PresetsAction,
+    },
     /// Start live dual-channel meeting/conversation capture and transcription.
     Start {
         #[arg(long)]
@@ -123,6 +140,15 @@ enum Commands {
         keywords: Vec<String>,
         #[arg(long)]
         drop_dir: Option<PathBuf>,
+        /// Optional calendar event UID for meeting-aware prefill.
+        #[arg(long)]
+        calendar_uid: Option<String>,
+        /// Optional meeting URL (Zoom/Meet/Teams/Webex) attached to the session.
+        #[arg(long)]
+        meeting_url: Option<String>,
+        /// Optional attendee names/emails attached to the session.
+        #[arg(long = "attendee")]
+        attendees: Vec<String>,
         /// Print live utterances to stdout as they are finalized.
         #[arg(long)]
         tail: bool,
@@ -238,6 +264,23 @@ enum ModelsAction {
     },
     /// Delete a cached model (`whistle`, `qwen`, `silero_vad`, `speaker_embed`, or `onnx`).
     Delete { id: String },
+}
+
+#[derive(Subcommand)]
+enum PresetsAction {
+    /// List saved keyword presets.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save or update a keyword preset.
+    Save {
+        name: String,
+        #[arg(long = "keywords", value_delimiter = ',')]
+        keywords: Vec<String>,
+    },
+    /// Delete a keyword preset by name.
+    Delete { name: String },
 }
 
 #[tokio::main]
@@ -360,6 +403,8 @@ async fn main() -> Result<()> {
             progress,
         } => {
             let (updated, used_qwen) = run_session_cleanup(&cfg, session_id, progress)?;
+            let store = SessionStore::open(&cfg.data_dir)?;
+            let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store, session_id, &cfg);
             if json {
                 println!(
                     "{}",
@@ -378,11 +423,104 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Commands::Summarize {
+            session_id,
+            template,
+            json,
+            progress,
+        } => {
+            let tmpl = template
+                .as_deref()
+                .unwrap_or(&cfg.default_summary_template);
+            let res = run_session_summarize(&cfg, session_id, tmpl, progress)?;
+            let store = SessionStore::open(&cfg.data_dir)?;
+            let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store, session_id, &cfg);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "session_id": session_id,
+                        "template": res.summary_template,
+                        "auto_title": res.auto_title,
+                        "summary_markdown": res.summary_markdown,
+                        "action_items": res.action_items,
+                    }))?
+                );
+            } else {
+                if let Some(ref t) = res.auto_title {
+                    println!("Title: {t}");
+                }
+                println!("Template: {}", res.summary_template);
+                println!("\n{}", res.summary_markdown);
+                if !res.action_items.is_empty() {
+                    println!("\nAction Items:");
+                    for item in &res.action_items {
+                        let owner = item.owner.as_deref().unwrap_or("Unassigned");
+                        println!("- [{}] {}", owner, item.task);
+                    }
+                }
+            }
+        }
+        Commands::Presets { action } => {
+            let mut cfg_mut = cfg.clone();
+            match action {
+                PresetsAction::List { json } => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&cfg_mut.keyword_presets)?);
+                    } else if cfg_mut.keyword_presets.is_empty() {
+                        println!("No keyword presets configured.");
+                    } else {
+                        for p in &cfg_mut.keyword_presets {
+                            println!("{}: {}", p.name, p.keywords.join(", "));
+                        }
+                    }
+                }
+                PresetsAction::Save { name, keywords } => {
+                    let clean_name = name.trim().to_string();
+                    anyhow::ensure!(!clean_name.is_empty(), "preset name cannot be empty");
+                    let clean_kws: Vec<String> = keywords
+                        .into_iter()
+                        .map(|k| k.trim().to_string())
+                        .filter(|k| !k.is_empty())
+                        .collect();
+                    if let Some(existing) = cfg_mut
+                        .keyword_presets
+                        .iter_mut()
+                        .find(|p| p.name.eq_ignore_ascii_case(&clean_name))
+                    {
+                        existing.keywords = clean_kws.clone();
+                    } else {
+                        cfg_mut.keyword_presets.push(mimir_core::KeywordPreset {
+                            name: clean_name.clone(),
+                            keywords: clean_kws.clone(),
+                        });
+                    }
+                    cfg_mut.save()?;
+                    println!("Saved preset '{clean_name}' ({} keyword(s)).", clean_kws.len());
+                }
+                PresetsAction::Delete { name } => {
+                    let before = cfg_mut.keyword_presets.len();
+                    cfg_mut
+                        .keyword_presets
+                        .retain(|p| !p.name.eq_ignore_ascii_case(name.trim()));
+                    anyhow::ensure!(
+                        cfg_mut.keyword_presets.len() < before,
+                        "preset '{}' not found",
+                        name.trim()
+                    );
+                    cfg_mut.save()?;
+                    println!("Deleted preset '{}'.", name.trim());
+                }
+            }
+        }
         Commands::Start {
             title,
             language,
             keywords,
             drop_dir,
+            calendar_uid,
+            meeting_url,
+            attendees,
             tail,
             serve,
             diarize_mic,
@@ -407,8 +545,19 @@ async fn main() -> Result<()> {
             let store = SessionStore::open(&cfg.data_dir)?;
             let mut merged_keywords = cfg.keywords.clone();
             merged_keywords.extend(keywords);
+            for att in &attendees {
+                let trimmed = att.trim();
+                if !trimmed.is_empty() && !merged_keywords.iter().any(|k| k.eq_ignore_ascii_case(trimmed)) {
+                    merged_keywords.push(trimmed.to_string());
+                }
+            }
 
             let mut session = Session::new(title, merged_keywords.clone());
+            session.calendar_event_uid = calendar_uid.filter(|s| !s.trim().is_empty());
+            session.meeting_url = meeting_url.filter(|s| !s.trim().is_empty());
+            if !attendees.is_empty() {
+                session.attendees_json = Some(serde_json::to_string(&attendees)?);
+            }
             store.create_session(&session)?;
 
             let (live_tx, _) = broadcast::channel(64);
@@ -523,6 +672,32 @@ async fn main() -> Result<()> {
                     updated,
                     if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
                 );
+            }
+            if cfg.auto_summarize {
+                let (qwen_weights, qwen_tok) = resolve_qwen_paths(&cfg);
+                if qwen_weights.is_file() && qwen_tok.is_file() {
+                    match run_session_summarize(
+                        &cfg,
+                        session_id,
+                        &cfg.default_summary_template,
+                        false,
+                    ) {
+                        Ok(res) => {
+                            eprintln!(
+                                "Summarized session {} (template: {}, action items: {}).",
+                                session_id,
+                                res.summary_template,
+                                res.action_items.len()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Auto-summarize skipped: {e}");
+                        }
+                    }
+                }
+            }
+            if let Ok(store_after) = SessionStore::open(&cfg.data_dir) {
+                let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store_after, session_id, &cfg);
             }
             eprintln!("Session {} saved.", session_id);
         }
@@ -826,4 +1001,30 @@ fn run_session_cleanup(
         },
     )?;
     Ok((updated, used_qwen))
+}
+
+fn run_session_summarize(
+    cfg: &MimirConfig,
+    session_id: Uuid,
+    template: &str,
+    emit_progress: bool,
+) -> Result<mimir_store::summarize::SessionSummaryResult> {
+    let store = SessionStore::open(&cfg.data_dir)?;
+    let (qwen_weights, qwen_tok) = resolve_qwen_paths(cfg);
+    anyhow::ensure!(
+        qwen_weights.is_file() && qwen_tok.is_file(),
+        "Qwen 2.5 0.5B Instruct is not installed (run `mimir fetch --qwen`)"
+    );
+    let mut qwen_model = QwenCleanupModel::load(&qwen_weights, &qwen_tok)?;
+    let res = store.summarize_session_with_progress(
+        session_id,
+        template,
+        |sys, usr, max_tok| qwen_model.complete(sys, usr, max_tok),
+        |done, total| {
+            if emit_progress {
+                eprintln!("PROGRESS:{done}:{total}");
+            }
+        },
+    )?;
+    Ok(res)
 }

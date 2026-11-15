@@ -452,6 +452,43 @@ struct RecordTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if !controller.isRecording, let ev = controller.upcomingEvents.first {
+                let now = Date()
+                let mins = Int((ev.startDate.timeIntervalSince(now) / 60.0).rounded())
+                let timing = (ev.startDate <= now && now <= ev.endDate)
+                    ? "Ongoing now"
+                    : (mins >= 0 ? "Starts in \(mins) min" : "Started \(-mins) min ago")
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("UPCOMING MEETING")
+                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(MimirTheme.ice)
+                        Text(ev.title)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(MimirTheme.textPrimary)
+                        Text("\(timing) · \(ev.attendees.count) attendee(s)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                    }
+                    Spacer()
+                    if ev.meetingUrl != nil {
+                        Button("Join & Record") {
+                            controller.joinAndRecord(ev, openURL: true)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(MimirTheme.azure)
+                    }
+                    Button("Record Only") {
+                        controller.joinAndRecord(ev, openURL: false)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(10)
+                .background(MimirTheme.activeFill)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.cyan.opacity(0.6), lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
             HStack(spacing: 10) {
                 TextField("Session title (optional)", text: $controller.sessionTitle)
                     .textFieldStyle(.plain)
@@ -471,6 +508,48 @@ struct RecordTab: View {
             }
             .font(.system(size: 12.5))
             .foregroundStyle(MimirTheme.textPrimary)
+
+            HStack(spacing: 8) {
+                Text("Preset:")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(MimirTheme.textSecondary)
+                Picker("Preset", selection: Binding(
+                    get: { controller.selectedPresetName },
+                    set: { controller.applyPreset($0) }
+                )) {
+                    Text("Select preset…").tag("")
+                    ForEach(controller.keywordPresets) { preset in
+                        Text(preset.name).tag(preset.name)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 150)
+
+                TextField("Preset name", text: $controller.presetNameInput)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(MimirTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .frame(width: 130)
+                    .background(MimirTheme.cardBg)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+
+                Button("Save Preset") {
+                    controller.saveCurrentPreset()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                if !controller.selectedPresetName.isEmpty {
+                    Button("Delete Preset") {
+                        controller.deleteSelectedPreset()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                Spacer()
+            }
 
             ScrollViewReader { proxy in
                 ScrollView {
@@ -671,12 +750,38 @@ struct SessionsTab: View {
                     Text("Cleaned").tag("cleaned")
                     Text("Raw").tag("raw")
                     Text("Diff").tag("diff")
+                    Text("Summary").tag("summary")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 190)
+                .frame(width: 240)
                 .fixedSize(horizontal: true, vertical: false)
                 .disabled(selectedSummary == nil)
+
+                Picker("Template", selection: $controller.selectedSummaryTemplate) {
+                    Text("General").tag("general")
+                    Text("1-on-1").tag("1on1")
+                    Text("Standup").tag("standup")
+                    Text("Sales").tag("sales_discovery")
+                    Text("Tech Review").tag("technical_review")
+                }
+                .labelsHidden()
+                .frame(width: 120)
+                .disabled(selectedSummary == nil || controller.isSummarizingSession)
+
+                Button(controller.isSummarizingSession ? "Summarizing…" : "Summarize") {
+                    controller.summarizeSelectedSession()
+                }
+                .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.ice)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.activeFill)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.ice.opacity(0.5), lineWidth: 1))
+                .disabled(selectedSummary == nil || controller.isSummarizingSession)
 
                 Button(controller.isCleaningSession ? "Cleaning…" : "Run Cleanup") {
                     controller.cleanupSelectedSession()
@@ -747,6 +852,32 @@ struct SessionsTab: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.cyan.opacity(0.35), lineWidth: 1))
             }
 
+            if controller.isSummarizingSession {
+                HStack(spacing: 10) {
+                    if controller.summarizeTotal > 0 {
+                        ProgressView(
+                            value: Double(controller.summarizeDone),
+                            total: Double(controller.summarizeTotal)
+                        )
+                        .progressViewStyle(.linear)
+                        .tint(MimirTheme.ice)
+                        Text("Step \(controller.summarizeDone) / \(controller.summarizeTotal)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.ice)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading Qwen 2.5 0.5B…")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.ice.opacity(0.35), lineWidth: 1))
+            }
+
             HStack(spacing: 8) {
                 TextField("Speaker ID (e.g. spk_1)", text: $controller.speakerIdEdit)
                     .textFieldStyle(.plain)
@@ -787,12 +918,47 @@ struct SessionsTab: View {
             }
 
             ScrollView {
-                Text(controller.selectedTranscript.isEmpty ? "Select a session from the left rail to inspect its transcript." : controller.selectedTranscript)
-                    .textSelection(.enabled)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(MimirTheme.textPrimary)
+                if controller.transcriptViewMode == "summary" {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("SUMMARY (\(controller.selectedSummaryTemplate))")
+                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(MimirTheme.ice)
+                        if controller.selectedSummaryMarkdown.isEmpty {
+                            Text("No summary generated yet — click Summarize above.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(MimirTheme.textMuted)
+                        } else {
+                            Text(controller.selectedSummaryMarkdown)
+                                .textSelection(.enabled)
+                                .font(.system(size: 13))
+                                .foregroundStyle(MimirTheme.textPrimary)
+                        }
+                        if !controller.selectedActionItems.isEmpty {
+                            Text("ACTION ITEMS")
+                                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(MimirTheme.cyan)
+                                .padding(.top, 6)
+                            ForEach(controller.selectedActionItems) { item in
+                                let owner = item.owner ?? "Unassigned"
+                                let due = item.due_hint.map { " (due: \($0))" } ?? ""
+                                let ts = item.timestamp.map { " [\($0)]" } ?? ""
+                                Text("• [\(owner)] \(item.task)\(due)\(ts)")
+                                    .textSelection(.enabled)
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(MimirTheme.textPrimary)
+                            }
+                        }
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(14)
+                } else {
+                    Text(controller.selectedTranscript.isEmpty ? "Select a session from the left rail to inspect its transcript." : controller.selectedTranscript)
+                        .textSelection(.enabled)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(MimirTheme.textPrimary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                }
             }
             .background(MimirTheme.cardBg)
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
@@ -806,6 +972,35 @@ struct AssistantsTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("AUTOMATION & CALENDAR")
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(MimirTheme.textMuted)
+                Toggle("Auto-summarize after recording (Qwen 2.5 0.5B)", isOn: Binding(
+                    get: { controller.autoSummarize },
+                    set: { controller.autoSummarize = $0; controller.saveConfigFlags() }
+                ))
+                Toggle("Sync exports to Drop Folder on stop / cleanup / summarize", isOn: Binding(
+                    get: { controller.dropSyncEnabled },
+                    set: { controller.dropSyncEnabled = $0; controller.saveConfigFlags() }
+                ))
+                HStack(spacing: 10) {
+                    Button("Refresh Calendar") {
+                        controller.refreshCalendarEvents()
+                    }
+                    .buttonStyle(.bordered)
+                    Text(controller.calendarAccessStatus)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(MimirTheme.textSecondary)
+                }
+            }
+            .font(.system(size: 12.5))
+            .foregroundStyle(MimirTheme.textPrimary)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(MimirTheme.cardBg)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
+
             VStack(alignment: .leading, spacing: 10) {
                 Text("MCP ASSISTANT AUTO-CONNECT")
                     .font(.system(size: 10.5, weight: .semibold, design: .monospaced))

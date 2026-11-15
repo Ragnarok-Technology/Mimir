@@ -207,6 +207,27 @@ fn tools_manifest() -> Value {
                         "keywords": { "type": "array", "items": { "type": "string" } }
                     }
                 }
+            },
+            {
+                "name": "get_summary",
+                "description": "Fetch the structured local summary, template, and extracted action items for a session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "UUID or 'latest'", "default": "latest" }
+                    }
+                }
+            },
+            {
+                "name": "summarize_session",
+                "description": "Run local Qwen 2.5 0.5B summarization, action-item extraction, and auto-titling on a session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "UUID or 'latest'", "default": "latest" },
+                        "template": { "type": "string", "enum": ["general", "1on1", "standup", "sales_discovery", "technical_review"], "default": "general" }
+                    }
+                }
             }
         ]
     })
@@ -382,6 +403,69 @@ fn handle_tool_call(store: &SessionStore, params: &Value) -> std::result::Result
             std::fs::write(&cfg_path, json_str).map_err(|e| (-32000, e.to_string()))?;
             Ok(tool_text(format!("keywords_count={}", kws.len())))
         }
+        "get_summary" => {
+            let sid_raw = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest");
+            let session = if sid_raw == "latest" {
+                store.latest_session().map_err(|e| (-32000, e.to_string()))?
+            } else {
+                let uuid = Uuid::parse_str(sid_raw).map_err(|e| (-32602, e.to_string()))?;
+                store.get_session(uuid).map_err(|e| (-32000, e.to_string()))?
+            };
+            let Some(session) = session else {
+                return Ok(tool_text("No transcription sessions found.".to_string()));
+            };
+            let action_items: Vec<mimir_core::ActionItem> = session
+                .action_items_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            let payload = json!({
+                "session_id": session.id,
+                "title": session.title,
+                "template": session.summary_template,
+                "summary_markdown": session.summary_markdown,
+                "action_items": action_items,
+            });
+            let text = serde_json::to_string_pretty(&payload).map_err(|e| (-32000, e.to_string()))?;
+            Ok(tool_text(wrap_untrusted_transcript(&text)))
+        }
+        "summarize_session" => {
+            let sid_raw = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest");
+            let session = if sid_raw == "latest" {
+                store.latest_session().map_err(|e| (-32000, e.to_string()))?
+            } else {
+                let uuid = Uuid::parse_str(sid_raw).map_err(|e| (-32602, e.to_string()))?;
+                store.get_session(uuid).map_err(|e| (-32000, e.to_string()))?
+            };
+            let Some(session) = session else {
+                return Ok(tool_text("No transcription sessions found.".to_string()));
+            };
+            let template = args
+                .get("template")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let exe = std::env::current_exe().map_err(|e| (-32000, e.to_string()))?;
+            let output = std::process::Command::new(exe)
+                .arg("summarize")
+                .arg(session.id.to_string())
+                .arg("--template")
+                .arg(template)
+                .arg("--json")
+                .output()
+                .map_err(|e| (-32000, format!("failed to run mimir summarize: {e}")))?;
+            if !output.status.success() {
+                let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err((-32000, if err.is_empty() { "summarize failed".to_string() } else { err }));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            Ok(tool_text(wrap_untrusted_transcript(stdout.trim())))
+        }
         unknown => Err((-32602, format!("unknown tool: {unknown}"))),
     }
 }
@@ -508,5 +592,33 @@ mod tests {
         assert!(lines[0].contains("protocolVersion"));
         assert!(lines[1].contains("<transcript_data"));
         assert!(lines[1].contains("Testing MCP bridge"));
+    }
+
+    #[test]
+    fn mcp_get_summary_and_tools_list() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut session = Session::new(Some("Roadmap".into()), vec![]);
+        session.summary_markdown = Some("### Key Decisions\n- Ship Phase 1 & 2.".into());
+        session.summary_template = Some("technical_review".into());
+        session.action_items_json = Some(r#"[{"owner":"Host","task":"Push PR","due_hint":null,"timestamp":null}]"#.into());
+        store.create_session(&session).unwrap();
+        drop(store);
+
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_summary","arguments":{"session_id":"latest"}}}"#, "\n"
+        );
+        let mut out = Vec::new();
+        serve_stdio(dir.path(), input.as_bytes(), &mut out).unwrap();
+
+        let output_str = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("get_summary"));
+        assert!(lines[0].contains("summarize_session"));
+        assert!(lines[1].contains("Ship Phase 1 & 2."));
+        assert!(lines[1].contains("technical_review"));
+        assert!(lines[1].contains("Push PR"));
     }
 }
