@@ -342,6 +342,12 @@ fn handle_tool_call(store: &SessionStore, params: &Value) -> std::result::Result
                     .arg(pid.to_string())
                     .status();
             }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .status();
+            }
             Ok(tool_text(format!("signaled_stop_pid={pid}")))
         }
         "set_keywords" => {

@@ -1,4 +1,5 @@
 import AppKit
+import CoreAudio
 import Foundation
 import MimirCore
 
@@ -18,6 +19,9 @@ final class MimirController: ObservableObject {
     @Published var isRecording = false
     @Published var diarizeMic = false
     @Published var saveWav = false
+    @Published var autoDetectCalls = false {
+        didSet { updateAutoDetectMonitor() }
+    }
     @Published var captureSystemAudio = true
     @Published var micActivity: Double = 0
     @Published var sysActivity: Double = 0
@@ -44,6 +48,8 @@ final class MimirController: ObservableObject {
     private var liveStdoutBuffer = ""
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
+    private var autoDetectTask: Task<Void, Never>?
+    private var wasAudioActiveBeforeStop = false
 
     /// Resolves the `mimir` CLI binary: prefers bundled `Contents/MacOS/mimir-cli` inside `.app`,
     /// falling back to repo `target/release/mimir` during development.
@@ -215,7 +221,58 @@ final class MimirController: ObservableObject {
         }
         micActivity = 0
         sysActivity = 0
+        wasAudioActiveBeforeStop = true
         statusMessage = "Finalizing transcript…"
+    }
+
+    private func updateAutoDetectMonitor() {
+        autoDetectTask?.cancel()
+        autoDetectTask = nil
+        guard autoDetectCalls else { return }
+        autoDetectTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, self.autoDetectCalls else { break }
+                let active = Self.isSystemOutputAudioRunning()
+                if !active {
+                    self.wasAudioActiveBeforeStop = false
+                } else if !self.isRecording && !self.wasAudioActiveBeforeStop {
+                    self.statusMessage = "Call/audio detected — starting local capture…"
+                    self.startRecording()
+                }
+            }
+        }
+    }
+
+    nonisolated private static func isSystemOutputAudioRunning() -> Bool {
+        var devId = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr,
+            0,
+            nil,
+            &size,
+            &devId
+        ) == noErr, devId != kAudioObjectUnknown else {
+            return false
+        }
+        var running: UInt32 = 0
+        var runSize = UInt32(MemoryLayout<UInt32>.size)
+        var runAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(devId, &runAddr, 0, nil, &runSize, &running) == noErr else {
+            return false
+        }
+        return running != 0
     }
 
     nonisolated private static func pcm16NormalizedLevel(_ data: Data) -> Double {

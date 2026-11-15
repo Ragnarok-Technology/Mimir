@@ -4,7 +4,8 @@ use crate::resampler::AudioNormalizer;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use mimir_core::{ChannelId, MimirError, Result};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use tracing::{info, warn};
 
 /// Raw normalized 16 kHz mono frame emitted by an audio capture stream.
@@ -17,6 +18,33 @@ pub struct CapturedFrame {
 /// Active OS audio capture session holding the underlying `cpal` streams.
 pub struct CaptureHandle {
     _streams: Vec<Stream>,
+    tx: mpsc::Sender<CapturedFrame>,
+    needs_reopen: Arc<AtomicBool>,
+    last_mic_name: Option<String>,
+}
+
+impl CaptureHandle {
+    /// Checks for stream errors or default input device changes and hot-swaps streams if needed.
+    pub fn check_and_reopen(&mut self) -> bool {
+        let host = cpal::default_host();
+        let cur_mic_name = host.default_input_device().and_then(|d| d.name().ok());
+        let dev_changed = cur_mic_name != self.last_mic_name;
+        if !self.needs_reopen.swap(false, Ordering::Relaxed) && !dev_changed {
+            return false;
+        }
+        info!("hot-swapping audio capture streams (device changed: {dev_changed})");
+        self._streams.clear();
+        if let Some(mic_dev) = host.default_input_device()
+            && let Ok(s) = build_input_stream(&mic_dev, ChannelId::Mic, self.tx.clone(), self.needs_reopen.clone())
+        {
+            self._streams.push(s);
+        }
+        if let Ok(Some(sys_stream)) = try_open_system_loopback(&host, self.tx.clone(), self.needs_reopen.clone()) {
+            self._streams.push(sys_stream);
+        }
+        self.last_mic_name = cur_mic_name;
+        true
+    }
 }
 
 /// Lists available input and loopback/monitor device names for diagnostics.
@@ -44,16 +72,24 @@ pub fn list_audio_devices() -> Result<Vec<String>> {
 pub fn start_dual_capture(tx: mpsc::Sender<CapturedFrame>) -> Result<CaptureHandle> {
     let host = cpal::default_host();
     let mut streams = Vec::new();
+    let needs_reopen = Arc::new(AtomicBool::new(false));
+    let mut last_mic_name = None;
 
     if let Some(mic_dev) = host.default_input_device() {
         let name = mic_dev.name().unwrap_or_else(|_| "default-mic".into());
+        last_mic_name = Some(name.clone());
         info!("opening mic capture device: {name}");
-        streams.push(build_input_stream(&mic_dev, ChannelId::Mic, tx.clone())?);
+        streams.push(build_input_stream(
+            &mic_dev,
+            ChannelId::Mic,
+            tx.clone(),
+            needs_reopen.clone(),
+        )?);
     } else {
         warn!("no default microphone device found");
     }
 
-    if let Some(sys_stream) = try_open_system_loopback(&host, tx)? {
+    if let Some(sys_stream) = try_open_system_loopback(&host, tx.clone(), needs_reopen.clone())? {
         streams.push(sys_stream);
     } else {
         warn!(
@@ -67,12 +103,18 @@ pub fn start_dual_capture(tx: mpsc::Sender<CapturedFrame>) -> Result<CaptureHand
         ));
     }
 
-    Ok(CaptureHandle { _streams: streams })
+    Ok(CaptureHandle {
+        _streams: streams,
+        tx,
+        needs_reopen,
+        last_mic_name,
+    })
 }
 
 fn try_open_system_loopback(
     host: &cpal::Host,
     tx: mpsc::Sender<CapturedFrame>,
+    needs_reopen: Arc<AtomicBool>,
 ) -> Result<Option<Stream>> {
     // 1. On Linux/macOS, look for an explicit monitor or loopback input device.
     if let Ok(inputs) = host.input_devices() {
@@ -86,7 +128,12 @@ fn try_open_system_loopback(
                 || lower.contains("stereo mix")
             {
                 info!("opening system loopback input device: {name}");
-                return Ok(Some(build_input_stream(&dev, ChannelId::System, tx)?));
+                return Ok(Some(build_input_stream(
+                    &dev,
+                    ChannelId::System,
+                    tx,
+                    needs_reopen,
+                )?));
             }
         }
     }
@@ -96,7 +143,12 @@ fn try_open_system_loopback(
     if let Some(out_dev) = host.default_output_device() {
         let name = out_dev.name().unwrap_or_else(|_| "default-loopback".into());
         info!("opening WASAPI loopback on output device: {name}");
-        return Ok(Some(build_input_stream(&out_dev, ChannelId::System, tx)?));
+        return Ok(Some(build_input_stream(
+            &out_dev,
+            ChannelId::System,
+            tx,
+            needs_reopen,
+        )?));
     }
 
     Ok(None)
@@ -106,6 +158,7 @@ fn build_input_stream(
     device: &cpal::Device,
     channel: ChannelId,
     tx: mpsc::Sender<CapturedFrame>,
+    needs_reopen: Arc<AtomicBool>,
 ) -> Result<Stream> {
     let supported = device
         .default_input_config()
@@ -117,6 +170,7 @@ fn build_input_stream(
 
     let err_fn = move |err| {
         warn!("audio stream error on {:?}: {err}", channel);
+        needs_reopen.store(true, Ordering::Relaxed);
     };
 
     let stream = match sample_format {
