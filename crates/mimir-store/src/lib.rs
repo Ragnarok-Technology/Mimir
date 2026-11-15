@@ -389,15 +389,31 @@ impl SessionStore {
 
     /// Runs a cleanup callback across all utterances in a session and persists changed text.
     /// Returns the number of utterances updated.
-    pub fn cleanup_session<F>(&self, session_id: Uuid, mut cleaner: F) -> Result<usize>
+    pub fn cleanup_session<F>(&self, session_id: Uuid, cleaner: F) -> Result<usize>
     where
         F: FnMut(&Utterance) -> Result<Option<String>>,
+    {
+        self.cleanup_session_with_progress(session_id, cleaner, |_, _| {})
+    }
+
+    /// Runs a cleanup callback across all utterances in a session, invoking `on_progress(done, total)`.
+    pub fn cleanup_session_with_progress<F, P>(
+        &self,
+        session_id: Uuid,
+        mut cleaner: F,
+        mut on_progress: P,
+    ) -> Result<usize>
+    where
+        F: FnMut(&Utterance) -> Result<Option<String>>,
+        P: FnMut(usize, usize),
     {
         let Some(session) = self.get_session(session_id)? else {
             return Err(MimirError::Storage(format!("session {session_id} not found")));
         };
+        let total = session.utterances.len();
+        on_progress(0, total);
         let mut updated = 0usize;
-        for utt in &session.utterances {
+        for (idx, utt) in session.utterances.iter().enumerate() {
             let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
             if let Some(cleaned) = cleaner(utt)? {
                 let cleaned = cleaned.trim();
@@ -406,6 +422,7 @@ impl SessionStore {
                     updated += 1;
                 }
             }
+            on_progress(idx + 1, total);
         }
         Ok(updated)
     }

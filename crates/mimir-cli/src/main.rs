@@ -86,6 +86,9 @@ enum Commands {
         session_id: Uuid,
         #[arg(long)]
         json: bool,
+        /// Emit machine-readable `PROGRESS:<done>:<total>` lines to stderr as utterances finish.
+        #[arg(long)]
+        progress: bool,
     },
     /// Start live dual-channel meeting/conversation capture and transcription.
     Start {
@@ -321,8 +324,12 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Commands::Cleanup { session_id, json } => {
-            let (updated, used_qwen) = run_session_cleanup(&cfg, session_id)?;
+        Commands::Cleanup {
+            session_id,
+            json,
+            progress,
+        } => {
+            let (updated, used_qwen) = run_session_cleanup(&cfg, session_id, progress)?;
             if json {
                 println!(
                     "{}",
@@ -479,7 +486,7 @@ async fn main() -> Result<()> {
 
             let _ = std::fs::remove_file(&pid_path);
             if enable_cleanup {
-                let (updated, used_qwen) = run_session_cleanup(&cfg, session_id)?;
+                let (updated, used_qwen) = run_session_cleanup(&cfg, session_id, false)?;
                 eprintln!(
                     "Post-processed session {} ({} utterance(s) updated, engine: {}).",
                     session_id,
@@ -734,7 +741,11 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_session_cleanup(cfg: &MimirConfig, session_id: Uuid) -> Result<(usize, bool)> {
+fn run_session_cleanup(
+    cfg: &MimirConfig,
+    session_id: Uuid,
+    emit_progress: bool,
+) -> Result<(usize, bool)> {
     let store = SessionStore::open(&cfg.data_dir)?;
     let Some(session) = store.get_session(session_id)? else {
         anyhow::bail!("session {session_id} not found");
@@ -752,19 +763,27 @@ fn run_session_cleanup(cfg: &MimirConfig, session_id: Uuid) -> Result<(usize, bo
         }
     }
     let used_qwen = qwen_model.is_some();
-    let updated = store.cleanup_session(session_id, |utt| {
-        let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
-        let base = basic_heuristic_cleanup(source, &kws);
-        let cleaned = if let Some(q) = qwen_model.as_mut() {
-            let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
-            match q.complete(&sys, &usr, 128) {
-                Ok(cand) => sanitize_cleanup_edit(&base, &cand),
-                Err(_) => base,
+    let updated = store.cleanup_session_with_progress(
+        session_id,
+        |utt| {
+            let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
+            let base = basic_heuristic_cleanup(source, &kws);
+            let cleaned = if let Some(q) = qwen_model.as_mut() {
+                let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
+                match q.complete(&sys, &usr, 128) {
+                    Ok(cand) => sanitize_cleanup_edit(&base, &cand),
+                    Err(_) => base,
+                }
+            } else {
+                base
+            };
+            Ok(Some(cleaned))
+        },
+        |done, total| {
+            if emit_progress {
+                eprintln!("PROGRESS:{done}:{total}");
             }
-        } else {
-            base
-        };
-        Ok(Some(cleaned))
-    })?;
+        },
+    )?;
     Ok((updated, used_qwen))
 }

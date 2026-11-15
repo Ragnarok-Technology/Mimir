@@ -34,6 +34,8 @@ enum Tab {
 enum UiEvent {
     LiveLine(String),
     Status(String),
+    CleanupProgress(usize, usize),
+    CleanupDone,
     SessionFinished,
     UpdateResult(UpdateStatus),
 }
@@ -63,6 +65,7 @@ struct MimirDesktopApp {
     speaker_id_edit: String,
     speaker_label_edit: String,
     status_line: String,
+    cleanup_progress: Option<(usize, usize)>,
     connect_report: String,
     update_line: String,
     event_tx: mpsc::Sender<UiEvent>,
@@ -101,6 +104,7 @@ impl MimirDesktopApp {
             speaker_id_edit: String::new(),
             speaker_label_edit: String::new(),
             status_line: "Ready — 100% Local • Whistle AI • Zero Telemetry".to_string(),
+            cleanup_progress: None,
             connect_report: String::new(),
             update_line: String::new(),
             event_tx,
@@ -449,6 +453,15 @@ impl MimirDesktopApp {
             match ev {
                 UiEvent::LiveLine(line) => self.live_lines.push(line),
                 UiEvent::Status(msg) => self.status_line = msg,
+                UiEvent::CleanupProgress(done, total) => {
+                    self.cleanup_progress = Some((done, total));
+                }
+                UiEvent::CleanupDone => {
+                    self.cleanup_progress = None;
+                    if let Some(sid) = self.selected_session_id {
+                        self.load_session(sid);
+                    }
+                }
                 UiEvent::SessionFinished => {
                     self.is_recording = false;
                     self.status_line = "Session saved locally.".into();
@@ -764,6 +777,7 @@ impl eframe::App for MimirDesktopApp {
                             let mut kws = self.cfg.keywords.clone();
                             let tx = self.event_tx.clone();
                             self.status_line = "Running local transcript cleanup…".into();
+                            self.cleanup_progress = Some((0, 0));
                             std::thread::spawn(move || {
                                 let res: anyhow::Result<String> = (|| {
                                     let store = SessionStore::open(&data_dir)?;
@@ -780,20 +794,26 @@ impl eframe::App for MimirDesktopApp {
                                         None
                                     };
                                     let used_qwen = qwen.is_some();
-                                    let updated = store.cleanup_session(sel_id, |utt| {
-                                        let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
-                                        let base = basic_heuristic_cleanup(src, &kws);
-                                        let cleaned = if let Some(q) = qwen.as_mut() {
-                                            let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
-                                            match q.complete(&sys, &usr, 128) {
-                                                Ok(cand) => sanitize_cleanup_edit(&base, &cand),
-                                                Err(_) => base,
-                                            }
-                                        } else {
-                                            base
-                                        };
-                                        Ok(Some(cleaned))
-                                    })?;
+                                    let updated = store.cleanup_session_with_progress(
+                                        sel_id,
+                                        |utt| {
+                                            let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
+                                            let base = basic_heuristic_cleanup(src, &kws);
+                                            let cleaned = if let Some(q) = qwen.as_mut() {
+                                                let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
+                                                match q.complete(&sys, &usr, 128) {
+                                                    Ok(cand) => sanitize_cleanup_edit(&base, &cand),
+                                                    Err(_) => base,
+                                                }
+                                            } else {
+                                                base
+                                            };
+                                            Ok(Some(cleaned))
+                                        },
+                                        |done, total| {
+                                            let _ = tx.send(UiEvent::CleanupProgress(done, total));
+                                        },
+                                    )?;
                                     Ok(format!(
                                         "Cleaned {updated} utterance(s) via {}",
                                         if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
@@ -803,10 +823,25 @@ impl eframe::App for MimirDesktopApp {
                                     Ok(s) => s,
                                     Err(e) => format!("Cleanup error: {e}"),
                                 };
+                                let _ = tx.send(UiEvent::CleanupDone);
                                 let _ = tx.send(UiEvent::Status(msg));
                             });
                         }
                     });
+                    if let Some((done, total)) = self.cleanup_progress {
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let label = if total > 0 {
+                            format!("Cleaning {done} / {total} utterances…")
+                        } else {
+                            "Loading Qwen 2.5 0.5B…".to_string()
+                        };
+                        ui.add(egui::ProgressBar::new(frac).text(label).animate(total == 0));
+                        ui.ctx().request_repaint();
+                    }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add(

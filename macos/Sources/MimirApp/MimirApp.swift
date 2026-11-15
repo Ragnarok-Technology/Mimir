@@ -638,6 +638,32 @@ struct SessionsTab: View {
                 .disabled(controller.selectedTranscript.isEmpty)
             }
 
+            if controller.isCleaningSession {
+                HStack(spacing: 10) {
+                    if controller.cleanupTotal > 0 {
+                        ProgressView(
+                            value: Double(controller.cleanupDone),
+                            total: Double(controller.cleanupTotal)
+                        )
+                        .progressViewStyle(.linear)
+                        .tint(MimirTheme.cyan)
+                        Text("\(controller.cleanupDone) / \(controller.cleanupTotal)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.cyan)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading Qwen 2.5 0.5B…")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.cyan.opacity(0.35), lineWidth: 1))
+            }
+
             HStack(spacing: 8) {
                 TextField("Speaker ID (e.g. spk_1)", text: $controller.speakerIdEdit)
                     .textFieldStyle(.plain)

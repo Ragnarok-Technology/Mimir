@@ -54,6 +54,8 @@ final class MimirController: ObservableObject {
     @Published var modelStatuses: [MimirModelStatus] = []
     @Published var activeModelTaskId: String?
     @Published var isCleaningSession = false
+    @Published var cleanupDone = 0
+    @Published var cleanupTotal = 0
 
     private var recordProcess: Process?
     private var stdinPipe: Pipe?
@@ -508,9 +510,42 @@ final class MimirController: ObservableObject {
     func cleanupSelectedSession() {
         guard let sid = selectedSessionId else { return }
         isCleaningSession = true
+        cleanupDone = 0
+        cleanupTotal = 0
         statusMessage = "Running local Qwen transcript cleanup…"
+        let bin = mimirBinaryURL
         Task {
-            let output = await runCli(["cleanup", sid])
+            let output: String = await withCheckedContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let proc = Process()
+                    proc.executableURL = bin
+                    proc.arguments = ["cleanup", sid, "--progress"]
+                    let outPipe = Pipe()
+                    let errPipe = Pipe()
+                    proc.standardOutput = outPipe
+                    proc.standardError = errPipe
+
+                    errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                        let data = handle.availableData
+                        guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                        for line in chunk.components(separatedBy: .newlines) where line.hasPrefix("PROGRESS:") {
+                            let parts = line.split(separator: ":")
+                            if parts.count == 3, let d = Int(parts[1]), let t = Int(parts[2]) {
+                                Task { @MainActor [weak self] in
+                                    self?.cleanupDone = d
+                                    self?.cleanupTotal = t
+                                }
+                            }
+                        }
+                    }
+
+                    try? proc.run()
+                    proc.waitUntilExit()
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    cont.resume(returning: String(data: outData, encoding: .utf8) ?? "")
+                }
+            }
             self.isCleaningSession = false
             let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
