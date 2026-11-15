@@ -82,6 +82,9 @@ enum Commands {
         /// Retain local 16 kHz mono .wav audio files for this session (`FR-4.4`).
         #[arg(long)]
         save_wav: bool,
+        /// Enable opt-in local first-pass cleanup (keyword repair + optional loopback LLM).
+        #[arg(long)]
+        cleanup: bool,
     },
     /// Stop an active background Mimir capture session.
     Stop,
@@ -224,6 +227,7 @@ async fn main() -> Result<()> {
             diarize_mic,
             system_pcm_stdin,
             save_wav,
+            cleanup,
         } => {
             let lib_path = resolve_lib_path(&cfg);
             let weights_path = resolve_weights_path(&cfg);
@@ -309,10 +313,23 @@ async fn main() -> Result<()> {
                 let _ = stop_tx.send(());
             });
 
+            let extras = pipeline::PipelineExtras {
+                speaker_onnx: cfg
+                    .speaker_onnx_path
+                    .clone()
+                    .or_else(|| Some(cfg.data_dir.join("speaker_embed.onnx"))),
+                vad_onnx: cfg
+                    .vad_onnx_path
+                    .clone()
+                    .or_else(|| Some(cfg.data_dir.join("silero_vad.onnx"))),
+                cleanup_enabled: cleanup || cfg.cleanup_enabled,
+                cleanup_endpoint: cfg.cleanup_endpoint.clone(),
+                cleanup_model: cfg.cleanup_model.clone(),
+            };
             let session_id = session.id;
             std::thread::scope(|s| {
                 let handle = s.spawn(move || {
-                    pipeline::run_pipeline_with_wav(
+                    pipeline::run_pipeline_with_extras(
                         rx,
                         &engine,
                         &store,
@@ -327,6 +344,7 @@ async fn main() -> Result<()> {
                         drop_target.as_deref(),
                         wav_target.as_deref(),
                         tail,
+                        &extras,
                     )
                 });
                 let _ = stop_rx.recv();

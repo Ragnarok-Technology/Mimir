@@ -1,6 +1,7 @@
 //! Per-channel Voice Activity Detection (VAD) and <= 28s chunking for Whistle.
 
 use crate::bleed::frame_rms;
+use crate::silero::SileroVadOnnx;
 use mimir_core::{AudioChunk, ChannelId, WHISTLE_SAMPLE_RATE};
 use std::collections::VecDeque;
 
@@ -23,6 +24,7 @@ pub struct VadChunker {
     silence_frames: usize,
     voiced_frames: usize,
     pending_frame: Vec<f32>,
+    silero: Option<(SileroVadOnnx, f32)>,
 }
 
 impl VadChunker {
@@ -38,7 +40,14 @@ impl VadChunker {
             silence_frames: 0,
             voiced_frames: 0,
             pending_frame: Vec::with_capacity(FRAME_SAMPLES),
+            silero: None,
         }
+    }
+
+    /// Attaches an optional Silero VAD ONNX model with probability threshold (e.g. `0.45`).
+    pub fn with_silero(mut self, model: SileroVadOnnx, prob_threshold: f32) -> Self {
+        self.silero = Some((model, prob_threshold));
+        self
     }
 
     /// Feeds 16 kHz mono samples and returns any completed speech chunks.
@@ -49,7 +58,12 @@ impl VadChunker {
         while self.pending_frame.len() >= FRAME_SAMPLES {
             let frame: Vec<f32> = self.pending_frame.drain(..FRAME_SAMPLES).collect();
             let rms = frame_rms(&frame);
-            let is_voiced = rms >= self.energy_threshold;
+            let is_voiced = if let Some((ref mut silero, prob_thresh)) = self.silero {
+                rms >= (self.energy_threshold * 0.25)
+                    && silero.speech_probability(&frame).unwrap_or(0.0) >= prob_thresh
+            } else {
+                rms >= self.energy_threshold
+            };
 
             if !self.in_speech {
                 if is_voiced {

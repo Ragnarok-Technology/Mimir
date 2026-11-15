@@ -474,6 +474,7 @@ mod tests {
                     start_ms: 500,
                     end_ms: 1500,
                     text: "Testing MCP bridge".into(),
+                    raw_text: None,
                     language: "en".into(),
                     avg_confidence: 0.99,
                     words: vec![],

@@ -1,13 +1,17 @@
 //! Live and testable dual-channel audio -> Whistle -> Diarize -> Store pipeline.
 
 use chrono::Utc;
-use mimir_audio::{BleedGate, CapturedFrame, VadChunker};
+use mimir_audio::{BleedGate, CapturedFrame, SileroVadOnnx, VadChunker};
 use mimir_core::{AudioChunk, ChannelId, Result, Session, Utterance};
-use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
+use mimir_diarize::{
+    Diarizer, DiarizerConfig, OnnxSpeakerEmbedder, SpeakerEmbedder, insert_utterance_chronological,
+    mean_pool_frames,
+};
+use mimir_store::cleanup::cleanup_utterance_local;
 use mimir_store::{SessionStore, sync_to_drop_dir};
 use mimir_whistle::{TranscribeOptions, TranscribeResult, WhistleEngine};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -64,6 +68,16 @@ pub fn run_pipeline<A: AsrBackend>(
     )
 }
 
+/// Optional ONNX VAD / Speaker-Embedding and local cleanup configuration for `run_pipeline_with_extras`.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineExtras {
+    pub speaker_onnx: Option<PathBuf>,
+    pub vad_onnx: Option<PathBuf>,
+    pub cleanup_enabled: bool,
+    pub cleanup_endpoint: Option<String>,
+    pub cleanup_model: Option<String>,
+}
+
 /// Processes `CapturedFrame`s with optional local `.wav` retention (`FR-4.4`).
 pub fn run_pipeline_with_wav<A: AsrBackend>(
     rx: mpsc::Receiver<CapturedFrame>,
@@ -77,9 +91,53 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
     wav_dir: Option<&Path>,
     print_tail: bool,
 ) -> Result<()> {
+    run_pipeline_with_extras(
+        rx,
+        asr,
+        store,
+        session,
+        opts,
+        diarizer_cfg,
+        live_tx,
+        drop_dir,
+        wav_dir,
+        print_tail,
+        &PipelineExtras::default(),
+    )
+}
+
+/// Full pipeline with optional ONNX Silero VAD, ONNX speaker embeddings, `.wav` archival, and local cleanup.
+pub fn run_pipeline_with_extras<A: AsrBackend>(
+    rx: mpsc::Receiver<CapturedFrame>,
+    asr: &A,
+    store: &SessionStore,
+    session: &mut Session,
+    opts: &TranscribeOptions,
+    diarizer_cfg: DiarizerConfig,
+    live_tx: Option<&broadcast::Sender<Utterance>>,
+    drop_dir: Option<&Path>,
+    wav_dir: Option<&Path>,
+    print_tail: bool,
+    extras: &PipelineExtras,
+) -> Result<()> {
     let mut bleed_gate = BleedGate::default_20ms();
     let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
     let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
+    if let Some(vad_path) = &extras.vad_onnx
+        && vad_path.exists()
+    {
+        if let Ok(m) = SileroVadOnnx::load(vad_path) {
+            mic_vad = mic_vad.with_silero(m, 0.45);
+        }
+        if let Ok(m) = SileroVadOnnx::load(vad_path) {
+            sys_vad = sys_vad.with_silero(m, 0.45);
+        }
+    }
+    let onnx_embedder = extras
+        .speaker_onnx
+        .as_deref()
+        .filter(|p| p.exists())
+        .and_then(|p| OnnxSpeakerEmbedder::load(p).ok());
     let enrolled = store
         .list_voiceprints()
         .unwrap_or_default()
@@ -92,6 +150,7 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
         .collect();
     let mut diarizer = Diarizer::new(diarizer_cfg, enrolled);
     let mut recent_sys: Vec<Utterance> = Vec::new();
+    let mut recent_context: Vec<String> = Vec::new();
     let mut langs: HashSet<String> = HashSet::new();
     let mut mic_pcm: Vec<i16> = Vec::new();
     let mut sys_pcm: Vec<i16> = Vec::new();
@@ -129,9 +188,12 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
                 opts,
                 &mut diarizer,
                 &mut recent_sys,
+                &mut recent_context,
                 &mut langs,
                 live_tx,
                 print_tail,
+                onnx_embedder.as_ref(),
+                extras,
             )?;
         }
     }
@@ -145,9 +207,12 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
             opts,
             &mut diarizer,
             &mut recent_sys,
+            &mut recent_context,
             &mut langs,
             live_tx,
             print_tail,
+            onnx_embedder.as_ref(),
+            extras,
         )?;
     }
 
@@ -208,9 +273,12 @@ fn handle_chunk<A: AsrBackend>(
     opts: &TranscribeOptions,
     diarizer: &mut Diarizer,
     recent_sys: &mut Vec<Utterance>,
+    recent_context: &mut Vec<String>,
     langs: &mut HashSet<String>,
     live_tx: Option<&broadcast::Sender<Utterance>>,
     print_tail: bool,
+    onnx_embedder: Option<&OnnxSpeakerEmbedder>,
+    extras: &PipelineExtras,
 ) -> Result<()> {
     let (res, raw_emb) = asr.transcribe_with_embedding(chunk, opts)?;
     let trimmed = res.text.trim();
@@ -218,14 +286,18 @@ fn handle_chunk<A: AsrBackend>(
         return Ok(());
     }
 
-    let pooled_emb = raw_emb.as_deref().and_then(|v| {
-        // Whistle encoder produces 80 ms frames; if flat length is unknown dim, treat as 1 frame if <= 1024.
-        if v.len() <= 512 {
-            Some(v.to_vec())
-        } else {
-            mean_pool_frames(v, 384).or_else(|| Some(v.to_vec()))
-        }
-    });
+    let pooled_emb = onnx_embedder
+        .and_then(|emb| emb.embed_chunk(&chunk.samples).ok())
+        .or_else(|| {
+            raw_emb.as_deref().and_then(|v| {
+                // Whistle encoder produces 80 ms frames; if flat length is unknown dim, treat as 1 frame if <= 1024.
+                if v.len() <= 512 {
+                    Some(v.to_vec())
+                } else {
+                    mean_pool_frames(v, 384).or_else(|| Some(v.to_vec()))
+                }
+            })
+        });
 
     let words = res.into_word_tokens(chunk.start_ms);
     let end_ms = words
@@ -238,6 +310,23 @@ fn handle_chunk<A: AsrBackend>(
         words.iter().map(|w| w.probability).sum::<f32>() / words.len() as f32
     };
 
+    let (final_text, raw_text) = if extras.cleanup_enabled {
+        let cleaned = cleanup_utterance_local(
+            trimmed,
+            recent_context,
+            &opts.keywords,
+            extras.cleanup_endpoint.as_deref(),
+            extras.cleanup_model.as_deref(),
+        );
+        if cleaned != trimmed {
+            (cleaned, Some(trimmed.to_string()))
+        } else {
+            (trimmed.to_string(), None)
+        }
+    } else {
+        (trimmed.to_string(), None)
+    };
+
     let speaker = diarizer.assign_speaker(chunk.channel, pooled_emb.as_deref());
     let utterance = Utterance {
         id: Uuid::new_v4(),
@@ -245,7 +334,8 @@ fn handle_chunk<A: AsrBackend>(
         channel: chunk.channel,
         start_ms: chunk.start_ms,
         end_ms,
-        text: trimmed.to_string(),
+        text: final_text,
+        raw_text,
         language: res.language.clone(),
         avg_confidence: avg_conf,
         words,
@@ -253,6 +343,11 @@ fn handle_chunk<A: AsrBackend>(
 
     if chunk.channel == ChannelId::Mic && diarizer.is_ghost_bleed(&utterance, recent_sys) {
         return Ok(());
+    }
+
+    recent_context.push(format!("{}: {}", speaker.label, utterance.text));
+    if recent_context.len() > 5 {
+        recent_context.remove(0);
     }
 
     if chunk.channel == ChannelId::System {

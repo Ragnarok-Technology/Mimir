@@ -2,11 +2,15 @@ mod updater;
 
 use chrono::Utc;
 use eframe::egui;
-use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
+use mimir_audio::{BleedGate, SileroVadOnnx, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
 use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, TranscriptFormat, Utterance};
-use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
+use mimir_diarize::{
+    Diarizer, DiarizerConfig, OnnxSpeakerEmbedder, SpeakerEmbedder, insert_utterance_chronological,
+    mean_pool_frames,
+};
+use mimir_store::cleanup::cleanup_utterance_local;
 use mimir_store::{SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir, export::render_session};
 use mimir_whistle::artifact::{fetch_whistle_weights, resolve_lib_path, resolve_weights_path};
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
@@ -39,6 +43,7 @@ struct MimirDesktopApp {
     diarize_mic: bool,
     save_wav: bool,
     encrypt_at_rest: bool,
+    cleanup_enabled: bool,
     is_recording: bool,
     stop_flag: Option<Arc<AtomicBool>>,
     mic_level: Arc<AtomicU32>,
@@ -68,6 +73,7 @@ impl MimirDesktopApp {
         let (event_tx, event_rx) = mpsc::channel();
         let save_wav = matches!(cfg.audio_retention, AudioRetention::ArchiveWav);
         let encrypt_at_rest = cfg.encrypt_at_rest;
+        let cleanup_enabled = cfg.cleanup_enabled;
         let mut app = Self {
             cfg,
             tab: Tab::Live,
@@ -77,6 +83,7 @@ impl MimirDesktopApp {
             diarize_mic: false,
             save_wav,
             encrypt_at_rest,
+            cleanup_enabled,
             is_recording: false,
             stop_flag: None,
             mic_level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
@@ -219,6 +226,7 @@ impl MimirDesktopApp {
         let diarize_mic = self.diarize_mic;
         let save_wav = self.save_wav;
         let encrypt_at_rest = self.encrypt_at_rest;
+        let cleanup_enabled = self.cleanup_enabled;
         let mic_level = self.mic_level.clone();
         let sys_level = self.sys_level.clone();
         let tx_ui = self.event_tx.clone();
@@ -236,6 +244,27 @@ impl MimirDesktopApp {
                 let mut bleed_gate = BleedGate::default_20ms();
                 let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
                 let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
+                let vad_path = cfg
+                    .vad_onnx_path
+                    .clone()
+                    .unwrap_or_else(|| cfg.data_dir.join("silero_vad.onnx"));
+                if vad_path.exists() {
+                    if let Ok(m) = SileroVadOnnx::load(&vad_path) {
+                        mic_vad = mic_vad.with_silero(m, 0.45);
+                    }
+                    if let Ok(m) = SileroVadOnnx::load(&vad_path) {
+                        sys_vad = sys_vad.with_silero(m, 0.45);
+                    }
+                }
+                let spk_onnx_path = cfg
+                    .speaker_onnx_path
+                    .clone()
+                    .unwrap_or_else(|| cfg.data_dir.join("speaker_embed.onnx"));
+                let onnx_embedder = if spk_onnx_path.exists() {
+                    OnnxSpeakerEmbedder::load(&spk_onnx_path).ok()
+                } else {
+                    None
+                };
                 let enrolled = store
                     .list_voiceprints()
                     .unwrap_or_default()
@@ -304,17 +333,46 @@ impl MimirDesktopApp {
                                     if trimmed.is_empty() {
                                         continue;
                                     }
-                                    let emb = engine.embed(&chunk.samples).ok().and_then(|v| {
-                                        if v.len() <= 512 {
-                                            Some(v)
-                                        } else {
-                                            mean_pool_frames(&v, 384).or(Some(v))
-                                        }
-                                    });
+                                    let emb = onnx_embedder
+                                        .as_ref()
+                                        .and_then(|e| e.embed_chunk(&chunk.samples).ok())
+                                        .or_else(|| {
+                                            engine.embed(&chunk.samples).ok().and_then(|v| {
+                                                if v.len() <= 512 {
+                                                    Some(v)
+                                                } else {
+                                                    mean_pool_frames(&v, 384).or(Some(v))
+                                                }
+                                            })
+                                        });
                                     let words = res.into_word_tokens(chunk.start_ms);
                                     let end_ms = words.last().map(|w| w.end_ms).unwrap_or(
                                         chunk.start_ms + (chunk.samples.len() as u64 * 1000 / 16_000),
                                     );
+                                    let (final_text, raw_text) = if cleanup_enabled {
+                                        let ctx_lines: Vec<String> = session
+                                            .utterances
+                                            .iter()
+                                            .rev()
+                                            .take(5)
+                                            .rev()
+                                            .map(|u| u.text.clone())
+                                            .collect();
+                                        let cleaned = cleanup_utterance_local(
+                                            trimmed,
+                                            &ctx_lines,
+                                            &opts.keywords,
+                                            cfg.cleanup_endpoint.as_deref(),
+                                            cfg.cleanup_model.as_deref(),
+                                        );
+                                        if cleaned != trimmed {
+                                            (cleaned, Some(trimmed.to_string()))
+                                        } else {
+                                            (trimmed.to_string(), None)
+                                        }
+                                    } else {
+                                        (trimmed.to_string(), None)
+                                    };
                                     let spk = diarizer.assign_speaker(chunk.channel, emb.as_deref());
                                     let utt = Utterance {
                                         id: Uuid::new_v4(),
@@ -322,7 +380,8 @@ impl MimirDesktopApp {
                                         channel: chunk.channel,
                                         start_ms: chunk.start_ms,
                                         end_ms,
-                                        text: trimmed.to_string(),
+                                        text: final_text,
+                                        raw_text,
                                         language: res.language.clone(),
                                         avg_confidence: 1.0,
                                         words,
@@ -573,6 +632,10 @@ impl eframe::App for MimirDesktopApp {
                     ui.add_enabled(
                         !self.is_recording,
                         egui::Checkbox::new(&mut self.encrypt_at_rest, "Encrypt at rest"),
+                    );
+                    ui.add_enabled(
+                        !self.is_recording,
+                        egui::Checkbox::new(&mut self.cleanup_enabled, "Cleanup pass"),
                     );
                     ui.add_space(8.0);
                     ui.separator();

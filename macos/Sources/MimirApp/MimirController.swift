@@ -19,6 +19,7 @@ final class MimirController: ObservableObject {
     @Published var isRecording = false
     @Published var diarizeMic = false
     @Published var saveWav = false
+    @Published var cleanupEnabled = false
     @Published var autoDetectCalls = false {
         didSet { updateAutoDetectMonitor() }
     }
@@ -118,6 +119,9 @@ final class MimirController: ObservableObject {
         }
         if saveWav {
             args.append("--save-wav")
+        }
+        if cleanupEnabled {
+            args.append("--cleanup")
         }
         for kw in keywordsText.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !kw.isEmpty {
             args += ["--keyword", kw]

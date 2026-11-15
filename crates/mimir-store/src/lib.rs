@@ -1,5 +1,6 @@
 //! Local session storage (SQLite FTS5 + crash-safe JSONL WAL) and drop-folder sync.
 
+pub mod cleanup;
 pub mod export;
 
 use chrono::{DateTime, Utc};
@@ -510,6 +511,7 @@ impl SessionStore {
                 start_ms: start_ms.max(0) as u64,
                 end_ms: end_ms.max(0) as u64,
                 text,
+                raw_text: None,
                 language,
                 avg_confidence,
                 words,
@@ -633,6 +635,7 @@ mod tests {
             start_ms,
             end_ms: start_ms + 1200,
             text: text.into(),
+            raw_text: None,
             language: "en".into(),
             avg_confidence: 0.94,
             words: vec![],

@@ -80,6 +80,8 @@ pub struct Utterance {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     pub language: String,
     pub avg_confidence: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -163,6 +165,16 @@ pub struct MimirConfig {
     pub auto_detect_calls: bool,
     #[serde(default)]
     pub encrypt_at_rest: bool,
+    #[serde(default)]
+    pub speaker_onnx_path: Option<PathBuf>,
+    #[serde(default)]
+    pub vad_onnx_path: Option<PathBuf>,
+    #[serde(default)]
+    pub cleanup_enabled: bool,
+    #[serde(default)]
+    pub cleanup_endpoint: Option<String>,
+    #[serde(default)]
+    pub cleanup_model: Option<String>,
 }
 
 impl Default for MimirConfig {
@@ -182,6 +194,11 @@ impl Default for MimirConfig {
             http_bind_addr: "127.0.0.1:7331".to_string(),
             auto_detect_calls: false,
             encrypt_at_rest: false,
+            speaker_onnx_path: None,
+            vad_onnx_path: None,
+            cleanup_enabled: false,
+            cleanup_endpoint: None,
+            cleanup_model: None,
         }
     }
 }
