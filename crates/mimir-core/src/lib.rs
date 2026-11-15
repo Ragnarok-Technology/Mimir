@@ -159,6 +159,10 @@ pub struct MimirConfig {
     pub keywords: Vec<String>,
     pub audio_retention: AudioRetention,
     pub http_bind_addr: String,
+    #[serde(default)]
+    pub auto_detect_calls: bool,
+    #[serde(default)]
+    pub encrypt_at_rest: bool,
 }
 
 impl Default for MimirConfig {
@@ -176,6 +180,8 @@ impl Default for MimirConfig {
             keywords: Vec::new(),
             audio_retention: AudioRetention::Ephemeral,
             http_bind_addr: "127.0.0.1:7331".to_string(),
+            auto_detect_calls: false,
+            encrypt_at_rest: false,
         }
     }
 }

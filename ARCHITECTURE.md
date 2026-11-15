@@ -1,7 +1,7 @@
 # Mimir — Software Architecture
 
-**Status:** Draft v1.0  
-**Last Updated:** 2026-11-14  
+**Status:** v0.1.0  
+**Last Updated:** 2026-11-15  
 **Traces To:** [REQUIREMENTS.md](file:///Users/joepeterson/development/Mimir/REQUIREMENTS.md)
 
 ---
@@ -28,8 +28,10 @@ Mimir/
     ├── mimir-whistle/          # Safe Rust wrapper + C FFI (-sys) for Cactus/Whistle
     ├── mimir-diarize/          # Embedding clustering, voiceprints, timeline merge
     ├── mimir-store/            # SQLite (FTS5), crash-safe JSONL WAL, MD/SRT export
-    ├── mimir-bridge/           # MCP server (stdio/SSE), Local HTTP/WS API, `connect`
-    └── mimir-cli/              # Binary entrypoint (`mimir`) + daemon orchestration
+    ├── mimir-bridge/           # MCP server (stdio/HTTP), Local HTTP/SSE API, `connect`
+    ├── mimir-cli/              # Binary entrypoint (`mimir`) + pipeline orchestration
+    └── mimir-ui/               # Cross-platform egui desktop app (`mimir-desktop`)
+macos/                          # Native macOS SwiftUI menu-bar & desktop app (`Mimir.app`)
 ```
 
 > **Note for Rust newcomers:** A Cargo *workspace* lets us keep each concern in its own small `crates/<name>/src/` folder with explicit dependencies between them. `cargo test` runs tests across all crates, and `cargo build --release` compiles everything into a single `mimir` executable.
@@ -143,14 +145,4 @@ Defines the canonical types shared across all crates:
 | **Audio Processor** | Resample, bleed gate, VAD, chunking | CPU-light, deterministic loop |
 | **Whistle Worker** | Runs `whistle.cact` C FFI inference | CPU-bound (`spawn_blocking` / dedicated thread) |
 | **Session Coordinator** | Diarization, timeline merge, SQLite/JSONL write, broadcast | Async (`tokio`) |
-| **Bridge Servers** | MCP (`stdio` / SSE) + `axum` HTTP/WS | Async (`tokio`) |
-
----
-
-## 6. Phased Implementation Roadmap
-
-1. **Phase 0 — FFI & Model Spike:** Verify `cactus-compute` C headers (`cactus.h` / `needle.h`) and `.cact` model loading; build a minimal `mimir-whistle` test that transcribes a 16 kHz WAV file with word timestamps and embeddings.
-2. **Phase 1 — Dual-Channel Audio Pipeline:** Implement `mimir-audio` (macOS ScreenCaptureKit + `cpal` mic first, followed by Windows WASAPI and Linux PipeWire) + resampler + VAD + bleed gate.
-3. **Phase 2 — Diarization & Store:** Implement `mimir-diarize` (embedding clustering + timeline merge) and `mimir-store` (SQLite FTS5 + JSONL + Markdown export).
-4. **Phase 3 — Universal Assistant Bridge:** Implement `mimir-bridge` (MCP server, local HTTP/SSE API, `mimir connect`) and `mimir-cli`.
-5. **Phase 4 — Cross-Platform Polish & Packaging:** Test Windows & Linux audio backends, add global hotkeys / optional tray icon, and set up release builds.
+| **Bridge Servers** | MCP (`stdio` / HTTP) + `axum` HTTP/SSE | Async (`tokio`) |

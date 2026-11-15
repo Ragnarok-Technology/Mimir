@@ -696,4 +696,90 @@ mod tests {
         assert!(store.list_sessions_filtered(10, true).unwrap().is_empty());
         assert!(store.search("Whistle", 10).unwrap().is_empty());
     }
+
+    #[test]
+    fn encryption_at_rest_roundtrip_and_tamper_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = b"RIFF....WAV_OR_JSONL_PAYLOAD";
+        let mut enc = encrypt_bytes_at_rest(dir.path(), plain).unwrap();
+        assert_ne!(&enc[..], plain);
+        let dec = decrypt_bytes_at_rest(dir.path(), &enc).unwrap();
+        assert_eq!(dec, plain);
+
+        let last = enc.len() - 1;
+        enc[last] ^= 0xFF;
+        assert!(decrypt_bytes_at_rest(dir.path(), &enc).is_err());
+    }
+}
+
+/// Ensures `dir` exists and has `0700` permissions on Unix.
+pub fn ensure_private_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+fn load_or_create_at_rest_key(data_dir: &Path) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    ensure_private_dir(data_dir)?;
+    let key_path = data_dir.join("mimir.key");
+    if key_path.exists() {
+        let bytes = fs::read(&key_path)?;
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(Uuid::new_v4().as_bytes());
+    hasher.update(Uuid::new_v4().as_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    fs::write(&key_path, key)?;
+    let _ = restrict_file_permissions(&key_path);
+    Ok(key)
+}
+
+/// Encrypts bytes with ChaCha20-Poly1305 using a local `0600` key in `data_dir`.
+/// Format: `"MIMIRENC1"` (9 bytes) || `nonce` (12 bytes) || `ciphertext`.
+pub fn encrypt_bytes_at_rest(data_dir: &Path, plaintext: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    use sha2::{Digest, Sha256};
+
+    let key = load_or_create_at_rest_key(data_dir)?;
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let nonce_hash = Sha256::digest(Uuid::new_v4().as_bytes());
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&nonce_hash[..12]);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|e| MimirError::Storage(format!("encryption failed: {e}")))?;
+
+    let mut out = Vec::with_capacity(9 + 12 + ciphertext.len());
+    out.extend_from_slice(b"MIMIRENC1");
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypts bytes produced by `encrypt_bytes_at_rest`.
+pub fn decrypt_bytes_at_rest(data_dir: &Path, blob: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+
+    if blob.len() < 21 || &blob[..9] != b"MIMIRENC1" {
+        return Err(MimirError::Storage("invalid encrypted Mimir blob header".into()));
+    }
+    let key = load_or_create_at_rest_key(data_dir)?;
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    cipher
+        .decrypt(Nonce::from_slice(&blob[9..21]), &blob[21..])
+        .map_err(|e| MimirError::Storage(format!("decryption failed: {e}")))
 }

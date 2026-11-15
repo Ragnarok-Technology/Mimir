@@ -7,7 +7,7 @@ use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
 use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, TranscriptFormat, Utterance};
 use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
-use mimir_store::{SearchHit, SessionStore, SessionSummary, export::render_session};
+use mimir_store::{SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir, export::render_session};
 use mimir_whistle::artifact::{fetch_whistle_weights, resolve_lib_path, resolve_weights_path};
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
 use std::collections::HashSet;
@@ -38,6 +38,7 @@ struct MimirDesktopApp {
     keywords_input: String,
     diarize_mic: bool,
     save_wav: bool,
+    encrypt_at_rest: bool,
     is_recording: bool,
     stop_flag: Option<Arc<AtomicBool>>,
     mic_level: Arc<AtomicU32>,
@@ -66,6 +67,7 @@ impl MimirDesktopApp {
         let cfg = MimirConfig::load_or_default().unwrap_or_default();
         let (event_tx, event_rx) = mpsc::channel();
         let save_wav = matches!(cfg.audio_retention, AudioRetention::ArchiveWav);
+        let encrypt_at_rest = cfg.encrypt_at_rest;
         let mut app = Self {
             cfg,
             tab: Tab::Live,
@@ -74,6 +76,7 @@ impl MimirDesktopApp {
             keywords_input: String::new(),
             diarize_mic: false,
             save_wav,
+            encrypt_at_rest,
             is_recording: false,
             stop_flag: None,
             mic_level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
@@ -215,6 +218,7 @@ impl MimirDesktopApp {
         );
         let diarize_mic = self.diarize_mic;
         let save_wav = self.save_wav;
+        let encrypt_at_rest = self.encrypt_at_rest;
         let mic_level = self.mic_level.clone();
         let sys_level = self.sys_level.clone();
         let tx_ui = self.event_tx.clone();
@@ -227,7 +231,7 @@ impl MimirDesktopApp {
                 store.create_session(&session)?;
 
                 let (audio_tx, audio_rx) = mpsc::channel();
-                let capture = start_dual_capture(audio_tx)?;
+                let mut capture = start_dual_capture(audio_tx)?;
 
                 let mut bleed_gate = BleedGate::default_20ms();
                 let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
@@ -344,7 +348,9 @@ impl MimirDesktopApp {
                                 }
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            capture.check_and_reopen();
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
@@ -354,12 +360,24 @@ impl MimirDesktopApp {
                 sys_level.store(0.0f32.to_bits(), Ordering::Relaxed);
                 if save_wav {
                     let audio_dir = cfg.data_dir.join("audio");
-                    let _ = std::fs::create_dir_all(&audio_dir);
+                    let _ = ensure_private_dir(&audio_dir);
                     if !mic_pcm.is_empty() {
-                        let _ = write_wav_i16(&audio_dir.join(format!("{}_mic.wav", session.id)), &mic_pcm, 16_000);
+                        save_pcm_wav_maybe_encrypted(
+                            &cfg.data_dir,
+                            &audio_dir,
+                            &format!("{}_mic", session.id),
+                            &mic_pcm,
+                            encrypt_at_rest,
+                        );
                     }
                     if !sys_pcm.is_empty() {
-                        let _ = write_wav_i16(&audio_dir.join(format!("{}_sys.wav", session.id)), &sys_pcm, 16_000);
+                        save_pcm_wav_maybe_encrypted(
+                            &cfg.data_dir,
+                            &audio_dir,
+                            &format!("{}_sys", session.id),
+                            &sys_pcm,
+                            encrypt_at_rest,
+                        );
                     }
                 }
                 let _ = store.finish_session(
@@ -444,6 +462,19 @@ impl MimirDesktopApp {
 impl eframe::App for MimirDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::M)) {
+            if self.is_recording {
+                self.stop_recording();
+            } else {
+                self.start_recording();
+            }
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::C))
+            && !self.selected_markdown.is_empty()
+        {
+            ctx.copy_text(self.selected_markdown.clone());
+            self.status_line = "Copied transcript to clipboard.".into();
+        }
         if self.is_recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
@@ -482,6 +513,9 @@ impl eframe::App for MimirDesktopApp {
                         ui.selectable_value(&mut self.tab, Tab::Assistants, "Assistants & Updates");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Hide").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
                         let mini_label = if self.mini_mode { "Full View" } else { "Mini Mode" };
                         if ui.button(mini_label).clicked() {
                             self.mini_mode = !self.mini_mode;
@@ -535,6 +569,10 @@ impl eframe::App for MimirDesktopApp {
                     ui.add_enabled(
                         !self.is_recording,
                         egui::Checkbox::new(&mut self.save_wav, "Save local WAVs"),
+                    );
+                    ui.add_enabled(
+                        !self.is_recording,
+                        egui::Checkbox::new(&mut self.encrypt_at_rest, "Encrypt at rest"),
                     );
                     ui.add_space(8.0);
                     ui.separator();
@@ -890,6 +928,24 @@ fn write_wav_i16(path: &std::path::Path, samples: &[i16], sample_rate: u32) -> s
         f.write_all(&s.to_le_bytes())?;
     }
     Ok(())
+}
+
+fn save_pcm_wav_maybe_encrypted(
+    data_dir: &std::path::Path,
+    audio_dir: &std::path::Path,
+    stem: &str,
+    samples: &[i16],
+    encrypt: bool,
+) {
+    let wav_path = audio_dir.join(format!("{stem}.wav"));
+    if write_wav_i16(&wav_path, samples, 16_000).is_ok() && encrypt {
+        if let Ok(raw) = std::fs::read(&wav_path)
+            && let Ok(enc) = encrypt_bytes_at_rest(data_dir, &raw)
+            && std::fs::write(audio_dir.join(format!("{stem}.wav.enc")), enc).is_ok()
+        {
+            let _ = std::fs::remove_file(&wav_path);
+        }
+    }
 }
 
 fn apply_obsidian_prism_theme(ctx: &egui::Context) {

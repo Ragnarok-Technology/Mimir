@@ -326,6 +326,7 @@ private struct LeftControlRail: View {
                     .disabled(controller.isRecording)
                 Toggle("Save Local WAVs", isOn: $controller.saveWav)
                     .disabled(controller.isRecording)
+                Toggle("Auto-Detect Calls", isOn: $controller.autoDetectCalls)
             }
             .font(.system(size: 12))
             .foregroundStyle(MimirTheme.textSecondary)
