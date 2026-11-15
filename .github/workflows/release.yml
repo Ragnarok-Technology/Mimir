@@ -22,7 +22,7 @@ jobs:
     name: Build macOS (Mimir.dmg & CLI/Desktop)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -43,16 +43,16 @@ jobs:
           cp macos/build/Mimir.dmg dist/Mimir.dmg
           tar -czf dist/mimir-macos.tar.gz -C target/release mimir mimir-desktop
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-macos
           path: dist/*
 
   build-linux:
     name: Build Linux (x86_64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -73,7 +73,7 @@ jobs:
           mkdir -p dist
           tar -czf dist/mimir-linux-x86_64.tar.gz -C target/release mimir mimir-desktop
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux
           path: dist/*
@@ -82,7 +82,7 @@ jobs:
     name: Build Windows (x86_64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -93,7 +93,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/mimir.exe, target/release/mimir-desktop.exe -DestinationPath dist/mimir-windows-x86_64.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-windows
           path: dist/*
@@ -101,20 +101,31 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [build-macos, build-linux, build-windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          generate_release_notes: true
-          files: |
-            artifacts/Mimir.dmg
-            artifacts/mimir-macos.tar.gz
-            artifacts/mimir-linux-x86_64.tar.gz
-            artifacts/mimir-windows-x86_64.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              artifacts/Mimir.dmg \
+              artifacts/mimir-macos.tar.gz \
+              artifacts/mimir-linux-x86_64.tar.gz \
+              artifacts/mimir-windows-x86_64.zip \
+              --clobber
+          else
+            gh release create "$TAG" \
+              artifacts/Mimir.dmg \
+              artifacts/mimir-macos.tar.gz \
+              artifacts/mimir-linux-x86_64.tar.gz \
+              artifacts/mimir-windows-x86_64.zip \
+              --title "$TAG" \
+              --generate-notes
+          fi
