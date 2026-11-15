@@ -662,6 +662,18 @@ struct SessionsTab: View {
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
                 .disabled(selectedSummary == nil)
 
+                Button("Run Cleanup") {
+                    controller.cleanupSelectedSession()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.ice)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.activeFill)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                .disabled(selectedSummary == nil)
+
                 Spacer()
             }
 

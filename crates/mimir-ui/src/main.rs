@@ -828,6 +828,27 @@ impl eframe::App for MimirDesktopApp {
                         if ui.button("Rename Speaker").clicked() {
                             self.rename_speaker_inline(sel_id);
                         }
+                        if ui.button("Run Cleanup").clicked()
+                            && let Ok(store) = SessionStore::open(&self.cfg.data_dir)
+                        {
+                            let mut kws = self.cfg.keywords.clone();
+                            kws.extend(
+                                self.keywords_input
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty()),
+                            );
+                            let n = store
+                                .cleanup_session(
+                                    sel_id,
+                                    &kws,
+                                    self.cfg.cleanup_endpoint.as_deref(),
+                                    self.cfg.cleanup_model.as_deref(),
+                                )
+                                .unwrap_or(0);
+                            self.status_line = format!("Cleanup updated {n} utterance(s).");
+                            self.load_session(sel_id);
+                        }
                     });
                     ui.add_space(6.0);
                 }

@@ -195,6 +195,78 @@ impl SessionStore {
         Ok(rows > 0)
     }
 
+    /// Updates an utterance's text in SQLite and re-indexes its FTS5 entry.
+    pub fn update_utterance_text(
+        &self,
+        session_id: Uuid,
+        utterance_id: Uuid,
+        new_text: &str,
+    ) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE utterances SET text = ?1 WHERE id = ?2 AND session_id = ?3",
+                params![new_text, utterance_id.to_string(), session_id.to_string()],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        if rows == 0 {
+            return Ok(false);
+        }
+        self.conn
+            .execute(
+                "DELETE FROM utterances_fts WHERE utterance_id = ?1",
+                params![utterance_id.to_string()],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO utterances_fts (text, utterance_id, session_id) VALUES (?1, ?2, ?3)",
+                params![new_text, utterance_id.to_string(), session_id.to_string()],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Runs the opt-in local cleanup pass over all utterances in a past session, returning the number updated.
+    pub fn cleanup_session(
+        &self,
+        session_id: Uuid,
+        extra_keywords: &[String],
+        endpoint: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<usize> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(0);
+        };
+        let mut keywords = session.keywords_used.clone();
+        for kw in extra_keywords {
+            if !keywords.iter().any(|k| k.eq_ignore_ascii_case(kw)) {
+                keywords.push(kw.clone());
+            }
+        }
+        let mut updated = 0usize;
+        let mut context: Vec<String> = Vec::new();
+        for utt in &session.utterances {
+            let cleaned = cleanup::cleanup_utterance_local(
+                &utt.text,
+                &context,
+                &keywords,
+                endpoint,
+                model,
+            );
+            if cleaned != utt.text && self.update_utterance_text(session_id, utt.id, &cleaned)? {
+                updated += 1;
+                context.push(cleaned);
+            } else {
+                context.push(utt.text.clone());
+            }
+            if context.len() > 5 {
+                context.remove(0);
+            }
+        }
+        Ok(updated)
+    }
+
     /// Appends an utterance to SQLite, FTS5, and the crash-safe per-session JSONL WAL.
     pub fn append_utterance(&self, session_id: Uuid, utterance: &Utterance) -> Result<()> {
         let ch = match utterance.channel {
@@ -712,6 +784,25 @@ mod tests {
         let last = enc.len() - 1;
         enc[last] ^= 0xFF;
         assert!(decrypt_bytes_at_rest(dir.path(), &enc).is_err());
+    }
+
+    #[test]
+    fn cleanup_session_updates_text_and_fts_index() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let session = Session::new(Some("Cleanup Test".into()), vec!["ERAM".into()]);
+        store.create_session(&session).unwrap();
+        let utt = sample_utterance(ChannelId::System, "remote_1", 1000, "Now why is eram down?");
+        store.append_utterance(session.id, &utt).unwrap();
+
+        let count = store
+            .cleanup_session(session.id, &["L3Harris".into()], None, None)
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let loaded = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(loaded.utterances[0].text, "Now why is ERAM down?");
+        assert_eq!(store.search("ERAM", 10).unwrap().len(), 1);
     }
 }
 

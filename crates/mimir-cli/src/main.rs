@@ -119,6 +119,12 @@ enum Commands {
     Delete {
         session_id: Uuid,
     },
+    /// Run the opt-in local cleanup pass on a past transcription session.
+    Cleanup {
+        session_id: Uuid,
+        #[arg(long = "keyword")]
+        keywords: Vec<String>,
+    },
     /// Print the latest transcription record.
     Latest {
         #[arg(long, value_enum, default_value_t = FormatArg::Md)]
@@ -460,6 +466,21 @@ async fn main() -> Result<()> {
             let ok = store.delete_session(session_id)?;
             anyhow::ensure!(ok, "session {session_id} not found");
             println!("Deleted session {session_id}");
+        }
+        Commands::Cleanup {
+            session_id,
+            keywords,
+        } => {
+            let store = SessionStore::open(&cfg.data_dir)?;
+            let mut merged = cfg.keywords.clone();
+            merged.extend(keywords);
+            let updated = store.cleanup_session(
+                session_id,
+                &merged,
+                cfg.cleanup_endpoint.as_deref(),
+                cfg.cleanup_model.as_deref(),
+            )?;
+            println!("Updated {updated} utterance(s) in session {session_id}");
         }
         Commands::Latest { format, copy } => {
             let store = SessionStore::open(&cfg.data_dir)?;

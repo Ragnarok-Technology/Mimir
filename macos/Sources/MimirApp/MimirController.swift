@@ -329,6 +329,21 @@ final class MimirController: ObservableObject {
         }
     }
 
+    func cleanupSelectedSession() {
+        guard let sessionId = selectedSessionId else { return }
+        var args = ["cleanup", sessionId]
+        for kw in keywordsText.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !kw.isEmpty {
+            args += ["--keyword", kw]
+        }
+        statusMessage = "Running local cleanup pass…"
+        Task {
+            let out = await runCli(args)
+            let msg = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.statusMessage = msg.isEmpty ? "Cleanup finished" : msg
+            self.selectSession(sessionId)
+        }
+    }
+
     private func appendStdoutChunk(_ text: String) {
         liveStdoutBuffer += text
         while let nl = liveStdoutBuffer.firstIndex(of: "\n") {
