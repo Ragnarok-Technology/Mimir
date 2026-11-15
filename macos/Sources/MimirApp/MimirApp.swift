@@ -11,6 +11,7 @@ struct MimirMacApp: App {
                 .frame(minWidth: 780, minHeight: 520)
                 .preferredColorScheme(.dark)
         }
+        .defaultSize(width: 1080, height: 700)
 
         MenuBarExtra {
             Button(controller.isRecording ? "Stop Recording" : "Start Recording") {
@@ -59,6 +60,51 @@ private func makeMenuBarTemplateIcon(isRecording: Bool) -> NSImage {
     }
     image.isTemplate = true
     return image
+}
+
+private struct WrappingHStack: Layout {
+    var horizontalSpacing: CGFloat = 8
+    var verticalSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var totalWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                totalWidth = max(totalWidth, x - horizontalSpacing)
+                x = 0
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            x += size.width + horizontalSpacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        totalWidth = max(totalWidth, max(0, x - horizontalSpacing))
+        return CGSize(width: proposal.width ?? totalWidth, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + horizontalSpacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
 }
 
 private enum MimirTheme {
@@ -557,13 +603,14 @@ struct SessionsTab: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
             }
 
-            HStack(spacing: 8) {
+            WrappingHStack(horizontalSpacing: 8, verticalSpacing: 8) {
                 TextField("Session title…", text: $controller.selectedTitleEdit)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(MimirTheme.textPrimary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
+                    .frame(minWidth: 160, idealWidth: 220, maxWidth: 280)
                     .background(MimirTheme.cardBg)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
                     .disabled(selectedSummary == nil)
@@ -573,6 +620,8 @@ struct SessionsTab: View {
                     controller.renameSelectedSession()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.textPrimary)
                 .padding(.horizontal, 10)
@@ -585,6 +634,8 @@ struct SessionsTab: View {
                     controller.toggleArchiveSelectedSession()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.textSecondary)
                 .padding(.horizontal, 10)
@@ -597,6 +648,8 @@ struct SessionsTab: View {
                     confirmDelete = true
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(Color.red.opacity(0.9))
                 .padding(.horizontal, 10)
@@ -621,12 +674,15 @@ struct SessionsTab: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 190)
+                .fixedSize(horizontal: true, vertical: false)
                 .disabled(selectedSummary == nil)
 
                 Button(controller.isCleaningSession ? "Cleaning…" : "Run Cleanup") {
                     controller.cleanupSelectedSession()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.cyan)
                 .padding(.horizontal, 10)
@@ -639,6 +695,8 @@ struct SessionsTab: View {
                     controller.revertSelectedSession()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.textSecondary)
                 .padding(.horizontal, 10)
@@ -651,6 +709,8 @@ struct SessionsTab: View {
                     controller.copySelectedTranscript()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.ice)
                 .padding(.horizontal, 10)
