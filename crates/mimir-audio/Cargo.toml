@@ -1,0 +1,11 @@
+[package]
+name = "mimir-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cpal.workspace = true
+mimir-core = { path = "../mimir-core" }
+rubato.workspace = true
+tracing.workspace = true

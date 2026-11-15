@@ -1,0 +1,29 @@
+[package]
+name = "mimir-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mimir"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+mimir-audio = { path = "../mimir-audio" }
+mimir-bridge = { path = "../mimir-bridge" }
+mimir-core = { path = "../mimir-core" }
+mimir-diarize = { path = "../mimir-diarize" }
+mimir-store = { path = "../mimir-store" }
+mimir-whistle = { path = "../mimir-whistle" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

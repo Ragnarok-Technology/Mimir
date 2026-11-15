@@ -1,0 +1,10 @@
+[package]
+name = "mimir-diarize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimir-core = { path = "../mimir-core" }
+serde.workspace = true
+uuid.workspace = true

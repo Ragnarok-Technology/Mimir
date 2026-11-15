@@ -1,0 +1,25 @@
+[package]
+name = "mimir-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mimir-desktop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+eframe.workspace = true
+mimir-audio = { path = "../mimir-audio" }
+mimir-bridge = { path = "../mimir-bridge" }
+mimir-core = { path = "../mimir-core" }
+mimir-diarize = { path = "../mimir-diarize" }
+mimir-store = { path = "../mimir-store" }
+mimir-whistle = { path = "../mimir-whistle" }
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+uuid.workspace = true

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux audio & UI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build release binaries (mimir & mimir-desktop)
+        run: cargo build --release --bin mimir --bin mimir-desktop
+
+  macos-swift:
+    name: macOS Swift & App Bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Swift package & run MimirCoreTests
+        run: |
+          ./macos/scripts/build.sh
+          BIN_DIR="$(./macos/scripts/build.sh --show-bin-path)"
+          "$BIN_DIR/MimirCoreTests"
+
+      - name: Bundle Mimir.app & Mimir.dmg
+        run: |
+          ./macos/scripts/bundle.sh
+          ./macos/scripts/package_dmg.sh
+
+      - name: Upload macOS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mimir-macos-ci
+          path: |
+            macos/build/Mimir.dmg
+            target/release/mimir-desktop

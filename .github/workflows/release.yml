@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release version tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    name: Build macOS (Mimir.dmg & CLI/Desktop)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build & test Swift core
+        run: |
+          ./macos/scripts/build.sh
+          BIN_DIR="$(./macos/scripts/build.sh --show-bin-path)"
+          "$BIN_DIR/MimirCoreTests"
+
+      - name: Build Mimir.app & Mimir.dmg
+        env:
+          MIMIR_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cargo build --release --bin mimir --bin mimir-desktop
+          ./macos/scripts/bundle.sh
+          ./macos/scripts/package_dmg.sh
+          mkdir -p dist
+          cp macos/build/Mimir.dmg dist/Mimir.dmg
+          tar -czf dist/mimir-macos.tar.gz -C target/release mimir mimir-desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist/*
+
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --bin mimir --bin mimir-desktop
+          mkdir -p dist
+          tar -czf dist/mimir-linux-x86_64.tar.gz -C target/release mimir mimir-desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*
+
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          cargo build --release --bin mimir --bin mimir-desktop
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/mimir.exe, target/release/mimir-desktop.exe -DestinationPath dist/mimir-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/Mimir.dmg
+            artifacts/mimir-macos.tar.gz
+            artifacts/mimir-linux-x86_64.tar.gz
+            artifacts/mimir-windows-x86_64.zip

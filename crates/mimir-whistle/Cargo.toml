@@ -1,0 +1,14 @@
+[package]
+name = "mimir-whistle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hex.workspace = true
+libloading.workspace = true
+mimir-core = { path = "../mimir-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ureq.workspace = true

@@ -1,0 +1,13 @@
+/target
+/macos/.build
+/macos/build
+**/*.rs.bk
+*.cact
+*.dylib
+*.so
+*.dll
+*.db
+*.db-wal
+*.db-shm
+*.wav
+.DS_Store
