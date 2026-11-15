@@ -50,14 +50,65 @@ pub fn run_pipeline<A: AsrBackend>(
     drop_dir: Option<&Path>,
     print_tail: bool,
 ) -> Result<()> {
+    run_pipeline_with_wav(
+        rx,
+        asr,
+        store,
+        session,
+        opts,
+        diarizer_cfg,
+        live_tx,
+        drop_dir,
+        None,
+        print_tail,
+    )
+}
+
+/// Processes `CapturedFrame`s with optional local `.wav` retention (`FR-4.4`).
+pub fn run_pipeline_with_wav<A: AsrBackend>(
+    rx: mpsc::Receiver<CapturedFrame>,
+    asr: &A,
+    store: &SessionStore,
+    session: &mut Session,
+    opts: &TranscribeOptions,
+    diarizer_cfg: DiarizerConfig,
+    live_tx: Option<&broadcast::Sender<Utterance>>,
+    drop_dir: Option<&Path>,
+    wav_dir: Option<&Path>,
+    print_tail: bool,
+) -> Result<()> {
     let mut bleed_gate = BleedGate::default_20ms();
     let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
     let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
-    let mut diarizer = Diarizer::new(diarizer_cfg, Vec::new());
+    let enrolled = store
+        .list_voiceprints()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| mimir_diarize::Voiceprint {
+            id: v.label.clone(),
+            label: v.label,
+            centroid: v.embedding,
+        })
+        .collect();
+    let mut diarizer = Diarizer::new(diarizer_cfg, enrolled);
     let mut recent_sys: Vec<Utterance> = Vec::new();
     let mut langs: HashSet<String> = HashSet::new();
+    let mut mic_pcm: Vec<i16> = Vec::new();
+    let mut sys_pcm: Vec<i16> = Vec::new();
 
     for mut frame in rx {
+        if wav_dir.is_some() {
+            let target = match frame.channel {
+                ChannelId::Mic => &mut mic_pcm,
+                ChannelId::System => &mut sys_pcm,
+            };
+            target.extend(
+                frame
+                    .samples
+                    .iter()
+                    .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16),
+            );
+        }
         let chunks = match frame.channel {
             ChannelId::System => {
                 bleed_gate.observe_system(&frame.samples);
@@ -113,6 +164,38 @@ pub fn run_pipeline<A: AsrBackend>(
         sync_to_drop_dir(session, dir)?;
     }
 
+    if let Some(wdir) = wav_dir {
+        std::fs::create_dir_all(wdir)?;
+        if !mic_pcm.is_empty() {
+            write_pcm16_wav(&wdir.join(format!("{}_mic.wav", session.id)), 16_000, &mic_pcm)?;
+        }
+        if !sys_pcm.is_empty() {
+            write_pcm16_wav(&wdir.join(format!("{}_sys.wav", session.id)), 16_000, &sys_pcm)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_pcm16_wav(path: &Path, sample_rate: u32, samples: &[i16]) -> Result<()> {
+    use std::io::Write;
+    let data_len = (samples.len() * 2) as u32;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // PCM chunk size
+    f.write_all(&1u16.to_le_bytes())?;  // PCM format
+    f.write_all(&1u16.to_le_bytes())?;  // Mono
+    f.write_all(&sample_rate.to_le_bytes())?;
+    f.write_all(&(sample_rate * 2).to_le_bytes())?; // Byte rate
+    f.write_all(&2u16.to_le_bytes())?;  // Block align
+    f.write_all(&16u16.to_le_bytes())?; // Bits per sample
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    for &s in samples {
+        f.write_all(&s.to_le_bytes())?;
+    }
     Ok(())
 }
 

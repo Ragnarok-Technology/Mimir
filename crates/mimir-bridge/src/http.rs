@@ -5,7 +5,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use mimir_core::{MimirConfig, MimirError, Result, TranscriptFormat, Utterance, restrict_file_permissions};
 use mimir_store::{SessionStore, export::render_session};
@@ -70,6 +70,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .route("/v1/sessions/{id}", get(get_session_handler))
         .route("/v1/search", get(search_handler))
         .route("/v1/live/stream", get(live_stream_handler))
+        .route("/mcp", post(mcp_http_handler))
         .with_state(state)
 }
 
@@ -209,6 +210,19 @@ async fn live_stream_handler(
         },
     );
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn mcp_http_handler(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: String,
+) -> std::result::Result<impl IntoResponse, StatusCode> {
+    authorize(&headers, &state.bearer_token)?;
+    let store = SessionStore::open(&state.data_dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match crate::mcp::handle_jsonrpc_line(&store, body.trim()) {
+        Some(resp) => Ok((StatusCode::OK, Json(serde_json::to_value(resp).unwrap_or_default()))),
+        None => Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "accepted": true })))),
+    }
 }
 
 #[cfg(test)]

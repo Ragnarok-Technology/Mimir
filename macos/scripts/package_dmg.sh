@@ -26,12 +26,47 @@ ATTACH_INFO=$(hdiutil attach -readwrite -noverify -noautoopen "$DMG_TEMP")
 DEVICE=$(echo "$ATTACH_INFO" | head -n 1 | awk '{print $1}')
 MOUNT_DIR=$(echo "$ATTACH_INFO" | grep -o '/Volumes/.*' | head -n 1)
 
+ROOT_DIR="$(cd "$MACOS_DIR/.." && pwd)"
+BG_IMG="$ROOT_DIR/assets/brand/dmg-background.png"
+
+if [ ! -f "$BG_IMG" ]; then
+    swift "$MACOS_DIR/scripts/gen_dmg_bg.swift" "$BG_IMG"
+fi
+
 cp -R "$APP_DIR" "$MOUNT_DIR/"
 ln -s /Applications "$MOUNT_DIR/Applications"
+mkdir -p "$MOUNT_DIR/.background"
+cp "$BG_IMG" "$MOUNT_DIR/.background/background.png"
+chflags hidden "$MOUNT_DIR/.background" 2>/dev/null || true
 if [ -f "$MACOS_DIR/Resources/AppIcon.icns" ]; then
     cp "$MACOS_DIR/Resources/AppIcon.icns" "$MOUNT_DIR/.VolumeIcon.icns" 2>/dev/null || true
     SetFile -a C "$MOUNT_DIR" 2>/dev/null || true
 fi
+
+echo "==> 3. Styling Finder DMG window (680x440 Refracted Obsidian)..."
+osascript <<'APPLESCRIPT' || echo "Warning: Finder AppleScript styling skipped (headless environment)"
+tell application "Finder"
+    tell disk "Mimir"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set the bounds of container window to {180, 180, 860, 620}
+        set viewOptions to the icon view options of container window
+        set arrangement of viewOptions to not arranged
+        set icon size of viewOptions to 112
+        set text size of viewOptions to 13
+        set background picture of viewOptions to file ".background:background.png"
+        set position of item "Mimir.app" of container window to {190, 214}
+        set position of item "Applications" of container window to {490, 214}
+        close
+        open
+        update without registering applications
+        delay 1
+        close
+    end tell
+end tell
+APPLESCRIPT
 
 sync
 hdiutil detach "$DEVICE" -force > /dev/null

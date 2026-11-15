@@ -79,7 +79,21 @@ enum Commands {
         /// Read 16 kHz mono f32LE system audio samples from stdin (used by Mimir.app ScreenCaptureKit tap).
         #[arg(long)]
         system_pcm_stdin: bool,
+        /// Retain local 16 kHz mono .wav audio files for this session (`FR-4.4`).
+        #[arg(long)]
+        save_wav: bool,
     },
+    /// Stop an active background Mimir capture session.
+    Stop,
+    /// Tail live utterances from the active/latest session to stdout.
+    Tail,
+    /// Enroll a speaker voiceprint from a local WAV sample for cross-session recognition.
+    Enroll {
+        label: String,
+        wav_path: PathBuf,
+    },
+    /// List enrolled local speaker voiceprints.
+    Voiceprints,
     /// List recent local transcription sessions.
     Sessions {
         #[arg(long, default_value_t = 20)]
@@ -106,6 +120,9 @@ enum Commands {
     Latest {
         #[arg(long, value_enum, default_value_t = FormatArg::Md)]
         format: FormatArg,
+        /// Copy the rendered transcript directly to the system clipboard.
+        #[arg(long)]
+        copy: bool,
     },
     /// Export a specific session by UUID.
     Export {
@@ -206,6 +223,7 @@ async fn main() -> Result<()> {
             serve,
             diarize_mic,
             system_pcm_stdin,
+            save_wav,
         } => {
             let lib_path = resolve_lib_path(&cfg);
             let weights_path = resolve_weights_path(&cfg);
@@ -267,7 +285,17 @@ async fn main() -> Result<()> {
             drop(tx);
             eprintln!("Mimir recording session {} (press Ctrl+C to stop)...", session.id);
 
+            let pid_path = cfg.data_dir.join("mimir.pid");
+            let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
             let drop_target = drop_dir.or_else(|| cfg.drop_dir.clone());
+            let wav_target = if save_wav
+                || matches!(cfg.audio_retention, mimir_core::AudioRetention::ArchiveWav)
+            {
+                Some(cfg.data_dir.join("audio"))
+            } else {
+                None
+            };
             let opts = TranscribeOptions {
                 language: language.or_else(|| cfg.default_language.clone()),
                 keywords: merged_keywords,
@@ -284,7 +312,7 @@ async fn main() -> Result<()> {
             let session_id = session.id;
             std::thread::scope(|s| {
                 let handle = s.spawn(move || {
-                    pipeline::run_pipeline(
+                    pipeline::run_pipeline_with_wav(
                         rx,
                         &engine,
                         &store,
@@ -297,6 +325,7 @@ async fn main() -> Result<()> {
                         },
                         Some(&live_tx),
                         drop_target.as_deref(),
+                        wav_target.as_deref(),
                         tail,
                     )
                 });
@@ -305,7 +334,74 @@ async fn main() -> Result<()> {
                 handle.join().expect("pipeline thread panicked")
             })?;
 
+            let _ = std::fs::remove_file(&pid_path);
             eprintln!("Session {} saved.", session_id);
+        }
+        Commands::Stop => {
+            let pid_path = cfg.data_dir.join("mimir.pid");
+            let pid_str = std::fs::read_to_string(&pid_path)
+                .with_context(|| format!("no active session PID file at {}", pid_path.display()))?;
+            let pid: i32 = pid_str.trim().parse().context("invalid PID in mimir.pid")?;
+            #[cfg(unix)]
+            {
+                let status = std::process::Command::new("kill")
+                    .arg("-INT")
+                    .arg(pid.to_string())
+                    .status()?;
+                anyhow::ensure!(status.success(), "failed to signal Mimir process {pid}");
+            }
+            println!("Signaled Mimir process {pid} to stop.");
+        }
+        Commands::Tail => {
+            use std::collections::HashSet;
+            use std::io::Write;
+            let store = SessionStore::open(&cfg.data_dir)?;
+            let mut seen = HashSet::new();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = stop_tx.send(());
+            });
+            loop {
+                if let Some(session) = store.latest_session()? {
+                    for u in &session.utterances {
+                        if seen.insert(u.id) {
+                            let label = session
+                                .speakers
+                                .get(&u.speaker_id)
+                                .map(|s| s.label.as_str())
+                                .unwrap_or(&u.speaker_id);
+                            println!("{}", mimir_bridge::mcp::format_live_utterance_md(label, u));
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                }
+                if stop_rx
+                    .recv_timeout(std::time::Duration::from_millis(400))
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        Commands::Enroll { label, wav_path } => {
+            let lib_path = resolve_lib_path(&cfg);
+            let weights_path = resolve_weights_path(&cfg);
+            anyhow::ensure!(lib_path.exists(), "libcactus not found at {}", lib_path.display());
+            anyhow::ensure!(weights_path.exists(), "whistle.cact not found at {}", weights_path.display());
+            let engine = WhistleEngine::load(&lib_path, &weights_path)?;
+            let samples = read_wav_16khz_mono(&wav_path)?;
+            let emb = engine.embed(&samples)?;
+            let pooled = mimir_diarize::mean_pool_frames(&emb, 384).unwrap_or(emb);
+            let store = SessionStore::open(&cfg.data_dir)?;
+            store.save_voiceprint(&label, &pooled)?;
+            println!("Enrolled voiceprint '{label}' ({} dims).", pooled.len());
+        }
+        Commands::Voiceprints => {
+            let store = SessionStore::open(&cfg.data_dir)?;
+            for vp in store.list_voiceprints()? {
+                println!("{} ({} dims)", vp.label, vp.embedding.len());
+            }
         }
         Commands::Sessions {
             limit,
@@ -347,12 +443,16 @@ async fn main() -> Result<()> {
             anyhow::ensure!(ok, "session {session_id} not found");
             println!("Deleted session {session_id}");
         }
-        Commands::Latest { format } => {
+        Commands::Latest { format, copy } => {
             let store = SessionStore::open(&cfg.data_dir)?;
             let session = store
                 .latest_session()?
                 .context("no transcription sessions found")?;
-            println!("{}", render_session(&session, format.into())?);
+            let rendered = render_session(&session, format.into())?;
+            if copy {
+                copy_to_clipboard(&rendered)?;
+            }
+            println!("{rendered}");
         }
         Commands::Export { session_id, format } => {
             let store = SessionStore::open(&cfg.data_dir)?;
@@ -462,4 +562,22 @@ fn read_wav_16khz_mono(path: &PathBuf) -> Result<Vec<f32>> {
     }
 
     anyhow::bail!("no data chunk found in WAV file")
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("pbcopy", &[])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", &["/C", "clip"])
+    } else {
+        ("xclip", &["-selection", "clipboard"])
+    };
+    let mut child = Command::new(cmd).args(args).stdin(Stdio::piped()).spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let _ = child.wait()?;
+    Ok(())
 }

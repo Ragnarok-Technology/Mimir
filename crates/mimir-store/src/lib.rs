@@ -39,6 +39,13 @@ pub struct SearchHit {
     pub text: String,
 }
 
+/// Enrolled local voiceprint persisted in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredVoiceprint {
+    pub label: String,
+    pub embedding: Vec<f32>,
+}
+
 /// Local SQLite + JSONL persistence layer.
 pub struct SessionStore {
     conn: Connection,
@@ -103,6 +110,12 @@ impl SessionStore {
                 text,
                 utterance_id UNINDEXED,
                 session_id UNINDEXED
+            );
+
+            CREATE TABLE IF NOT EXISTS voiceprints (
+                label TEXT PRIMARY KEY,
+                embedding_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             "#,
         )
@@ -362,6 +375,47 @@ impl SessionStore {
             let _ = fs::remove_file(wal_path);
         }
         Ok(rows > 0)
+    }
+
+    /// Saves or updates an enrolled local speaker voiceprint.
+    pub fn save_voiceprint(&self, label: &str, embedding: &[f32]) -> Result<()> {
+        let emb_json =
+            serde_json::to_string(embedding).map_err(|e| MimirError::Storage(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO voiceprints (label, embedding_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(label) DO UPDATE SET
+                   embedding_json = excluded.embedding_json,
+                   updated_at = excluded.updated_at",
+                params![label.trim(), emb_json, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Lists all enrolled local speaker voiceprints.
+    pub fn list_voiceprints(&self) -> Result<Vec<StoredVoiceprint>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT label, embedding_json FROM voiceprints ORDER BY label ASC")
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let label: String = r.get(0)?;
+                let emb_json: String = r.get(1)?;
+                Ok((label, emb_json))
+            })
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (label, emb_json) = r.map_err(|e| MimirError::Storage(e.to_string()))?;
+            let embedding: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+            if !embedding.is_empty() {
+                out.push(StoredVoiceprint { label, embedding });
+            }
+        }
+        Ok(out)
     }
 
     /// Loads a full `Session` (including speakers and chronologically ordered utterances).

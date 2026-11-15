@@ -5,13 +5,13 @@ use eframe::egui;
 use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
-use mimir_core::{ChannelId, MimirConfig, Session, TranscriptFormat, Utterance};
+use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, TranscriptFormat, Utterance};
 use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
-use mimir_store::{SessionStore, SessionSummary, export::render_session};
+use mimir_store::{SearchHit, SessionStore, SessionSummary, export::render_session};
 use mimir_whistle::artifact::{fetch_whistle_weights, resolve_lib_path, resolve_weights_path};
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use updater::{UpdateStatus, check_for_updates};
 use uuid::Uuid;
@@ -37,8 +37,11 @@ struct MimirDesktopApp {
     session_title: String,
     keywords_input: String,
     diarize_mic: bool,
+    save_wav: bool,
     is_recording: bool,
     stop_flag: Option<Arc<AtomicBool>>,
+    mic_level: Arc<AtomicU32>,
+    sys_level: Arc<AtomicU32>,
     live_lines: Vec<String>,
     sessions: Vec<SessionSummary>,
     show_archived: bool,
@@ -46,6 +49,10 @@ struct MimirDesktopApp {
     selected_title_edit: String,
     confirm_delete_id: Option<Uuid>,
     selected_markdown: String,
+    search_query: String,
+    search_results: Vec<SearchHit>,
+    speaker_id_edit: String,
+    speaker_label_edit: String,
     status_line: String,
     connect_report: String,
     update_line: String,
@@ -58,6 +65,7 @@ impl MimirDesktopApp {
         apply_obsidian_prism_theme(&cc.egui_ctx);
         let cfg = MimirConfig::load_or_default().unwrap_or_default();
         let (event_tx, event_rx) = mpsc::channel();
+        let save_wav = matches!(cfg.audio_retention, AudioRetention::ArchiveWav);
         let mut app = Self {
             cfg,
             tab: Tab::Live,
@@ -65,8 +73,11 @@ impl MimirDesktopApp {
             session_title: String::new(),
             keywords_input: String::new(),
             diarize_mic: false,
+            save_wav,
             is_recording: false,
             stop_flag: None,
+            mic_level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            sys_level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             live_lines: Vec::new(),
             sessions: Vec::new(),
             show_archived: false,
@@ -74,6 +85,10 @@ impl MimirDesktopApp {
             selected_title_edit: String::new(),
             confirm_delete_id: None,
             selected_markdown: String::new(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            speaker_id_edit: String::new(),
+            speaker_label_edit: String::new(),
             status_line: "Ready — 100% Local • Whistle AI • Zero Telemetry".to_string(),
             connect_report: String::new(),
             update_line: String::new(),
@@ -199,6 +214,9 @@ impl MimirDesktopApp {
                 .filter(|s| !s.is_empty()),
         );
         let diarize_mic = self.diarize_mic;
+        let save_wav = self.save_wav;
+        let mic_level = self.mic_level.clone();
+        let sys_level = self.sys_level.clone();
         let tx_ui = self.event_tx.clone();
 
         std::thread::spawn(move || {
@@ -214,16 +232,28 @@ impl MimirDesktopApp {
                 let mut bleed_gate = BleedGate::default_20ms();
                 let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
                 let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
+                let enrolled = store
+                    .list_voiceprints()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|v| mimir_diarize::Voiceprint {
+                        id: v.label.clone(),
+                        label: v.label,
+                        centroid: v.embedding,
+                    })
+                    .collect();
                 let mut diarizer = Diarizer::new(
                     DiarizerConfig {
                         host_label: cfg.host_label.clone(),
                         diarize_mic,
                         ..Default::default()
                     },
-                    vec![],
+                    enrolled,
                 );
                 let mut recent_sys: Vec<Utterance> = Vec::new();
                 let mut langs: HashSet<String> = HashSet::new();
+                let mut mic_pcm: Vec<i16> = Vec::new();
+                let mut sys_pcm: Vec<i16> = Vec::new();
                 let opts = TranscribeOptions {
                     language: cfg.default_language.clone(),
                     keywords,
@@ -233,6 +263,27 @@ impl MimirDesktopApp {
                 while !stop.load(Ordering::Relaxed) {
                     match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(mut frame) => {
+                            let rms = if frame.samples.is_empty() {
+                                0.0f32
+                            } else {
+                                (frame.samples.iter().map(|s| s * s).sum::<f32>()
+                                    / frame.samples.len() as f32)
+                                    .sqrt()
+                            };
+                            let norm = (rms * 8.0).clamp(0.0, 1.0);
+                            match frame.channel {
+                                ChannelId::Mic => mic_level.store(norm.to_bits(), Ordering::Relaxed),
+                                ChannelId::System => sys_level.store(norm.to_bits(), Ordering::Relaxed),
+                            }
+                            if save_wav {
+                                let target = match frame.channel {
+                                    ChannelId::Mic => &mut mic_pcm,
+                                    ChannelId::System => &mut sys_pcm,
+                                };
+                                for &s in &frame.samples {
+                                    target.push((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+                                }
+                            }
                             let chunks = match frame.channel {
                                 ChannelId::System => {
                                     bleed_gate.observe_system(&frame.samples);
@@ -299,6 +350,18 @@ impl MimirDesktopApp {
                 }
 
                 drop(capture);
+                mic_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                sys_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                if save_wav {
+                    let audio_dir = cfg.data_dir.join("audio");
+                    let _ = std::fs::create_dir_all(&audio_dir);
+                    if !mic_pcm.is_empty() {
+                        let _ = write_wav_i16(&audio_dir.join(format!("{}_mic.wav", session.id)), &mic_pcm, 16_000);
+                    }
+                    if !sys_pcm.is_empty() {
+                        let _ = write_wav_i16(&audio_dir.join(format!("{}_sys.wav", session.id)), &sys_pcm, 16_000);
+                    }
+                }
                 let _ = store.finish_session(
                     session.id,
                     Utc::now(),
@@ -318,8 +381,40 @@ impl MimirDesktopApp {
         if let Some(flag) = &self.stop_flag {
             flag.store(true, Ordering::Relaxed);
         }
+        self.mic_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.sys_level.store(0.0f32.to_bits(), Ordering::Relaxed);
         self.is_recording = false;
         self.status_line = "Stopping & saving session…".into();
+    }
+
+    fn run_search(&mut self) {
+        let q = self.search_query.trim();
+        if q.is_empty() {
+            self.search_results.clear();
+            return;
+        }
+        if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
+            && let Ok(hits) = store.search(q, 20)
+        {
+            self.search_results = hits;
+            self.status_line = format!("Found {} matching utterance(s).", self.search_results.len());
+        }
+    }
+
+    fn rename_speaker_inline(&mut self, session_id: Uuid) {
+        let spk_id = self.speaker_id_edit.trim().to_string();
+        let new_lbl = self.speaker_label_edit.trim().to_string();
+        if spk_id.is_empty() || new_lbl.is_empty() {
+            return;
+        }
+        if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
+            && store.rename_speaker(session_id, &spk_id, &new_lbl).unwrap_or(false)
+        {
+            self.status_line = format!("Renamed {spk_id} -> {new_lbl}");
+            self.speaker_id_edit.clear();
+            self.speaker_label_edit.clear();
+            self.load_session(session_id);
+        }
     }
 
     fn drain_events(&mut self) {
@@ -374,6 +469,12 @@ impl eframe::App for MimirDesktopApp {
                     let status_text = if self.is_recording { "● LIVE · CAPTURING" } else { "● STANDBY" };
                     let status_col = if self.is_recording { ice } else { cyan };
                     ui.label(egui::RichText::new(status_text).monospace().size(11.0).color(status_col));
+                    ui.add_space(10.0);
+                    let mic_lvl = f32::from_bits(self.mic_level.load(Ordering::Relaxed));
+                    let sys_lvl = f32::from_bits(self.sys_level.load(Ordering::Relaxed));
+                    draw_level_meter(ui, "MIC", mic_lvl, cyan, hairline, text_muted);
+                    ui.add_space(6.0);
+                    draw_level_meter(ui, "SYS", sys_lvl, azure, hairline, text_muted);
                     ui.add_space(12.0);
                     if !self.mini_mode {
                         ui.selectable_value(&mut self.tab, Tab::Live, "Live");
@@ -430,6 +531,10 @@ impl eframe::App for MimirDesktopApp {
                     ui.add_enabled(
                         !self.is_recording,
                         egui::Checkbox::new(&mut self.diarize_mic, "Multi-speaker mic"),
+                    );
+                    ui.add_enabled(
+                        !self.is_recording,
+                        egui::Checkbox::new(&mut self.save_wav, "Save local WAVs"),
                     );
                     ui.add_space(8.0);
                     ui.separator();
@@ -527,6 +632,49 @@ impl eframe::App for MimirDesktopApp {
                 });
             }
             Tab::Transcripts => {
+                ui.horizontal(|ui| {
+                    let q_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search transcripts (FTS5)…"),
+                    );
+                    if (q_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || ui.button("Search").clicked()
+                    {
+                        self.run_search();
+                    }
+                    if !self.search_results.is_empty() && ui.button("Clear").clicked() {
+                        self.search_query.clear();
+                        self.search_results.clear();
+                    }
+                });
+                if !self.search_results.is_empty() {
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(card_bg)
+                        .stroke(egui::Stroke::new(1.0, hairline))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("search_hits")
+                                .max_height(130.0)
+                                .show(ui, |ui| {
+                                    let hits = self.search_results.clone();
+                                    for hit in hits {
+                                        let lbl = format!(
+                                            "[{}] {}: {}",
+                                            hit.session_title.as_deref().unwrap_or("Untitled"),
+                                            hit.speaker_label,
+                                            hit.text
+                                        );
+                                        if ui.selectable_label(false, lbl).clicked() {
+                                            self.load_session(hit.session_id);
+                                        }
+                                    }
+                                });
+                        });
+                }
+                ui.add_space(6.0);
                 if let Some(sel_id) = self.selected_session_id {
                     let is_archived = self
                         .sessions
@@ -562,6 +710,22 @@ impl eframe::App for MimirDesktopApp {
                             .clicked()
                         {
                             self.confirm_delete_id = Some(sel_id);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.speaker_id_edit)
+                                .desired_width(90.0)
+                                .hint_text("Speaker ID"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.speaker_label_edit)
+                                .desired_width(140.0)
+                                .hint_text("New speaker name"),
+                        );
+                        if ui.button("Rename Speaker").clicked() {
+                            self.rename_speaker_inline(sel_id);
                         }
                     });
                     ui.add_space(6.0);
@@ -680,6 +844,52 @@ fn draw_grayscale_mimir_mark(ui: &mut egui::Ui, size: f32) {
     poly(&[(356.0, 189.21), (420.0, 125.21), (420.0, 394.15), (356.0, 344.23)], tone(150));
     poly(&[(92.0, 413.17), (156.0, 363.25), (156.0, 420.0), (92.0, 420.0)], tone(115));
     poly(&[(356.0, 363.25), (420.0, 413.17), (420.0, 420.0), (356.0, 420.0)], tone(115));
+}
+
+fn draw_level_meter(
+    ui: &mut egui::Ui,
+    label: &str,
+    level: f32,
+    active_col: egui::Color32,
+    inactive_col: egui::Color32,
+    label_col: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.label(egui::RichText::new(label).monospace().size(9.5).color(label_col));
+        ui.add_space(2.0);
+        let bars = 6usize;
+        let lit = (level * bars as f32).ceil() as usize;
+        for i in 0..bars {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 10.0), egui::Sense::hover());
+            let col = if i < lit { active_col } else { inactive_col };
+            ui.painter().rect_filled(rect, 1.0, col);
+        }
+    });
+}
+
+fn write_wav_i16(path: &std::path::Path, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    let data_bytes = (samples.len() * 2) as u32;
+    let riff_size = 36u32.saturating_add(data_bytes);
+    let byte_rate = sample_rate * 2;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(b"RIFF")?;
+    f.write_all(&riff_size.to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&sample_rate.to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_bytes.to_le_bytes())?;
+    for s in samples {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 fn apply_obsidian_prism_theme(ctx: &egui::Context) {

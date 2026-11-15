@@ -169,6 +169,43 @@ fn tools_manifest() -> Value {
                         "label": { "type": "string" }
                     }
                 }
+            },
+            {
+                "name": "get_live_transcript",
+                "description": "Tail the latest/active transcription session, returning the most recent utterances.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "last_n": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 }
+                    }
+                }
+            },
+            {
+                "name": "start_session",
+                "description": "Start a background local Mimir recording session if not already active.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "diarize_mic": { "type": "boolean", "default": false }
+                    }
+                }
+            },
+            {
+                "name": "stop_session",
+                "description": "Stop an active background Mimir recording session.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "set_keywords",
+                "description": "Update keyword biasing terms for Whistle AI decoding.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["keywords"],
+                    "properties": {
+                        "keywords": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
             }
         ]
     })
@@ -248,17 +285,104 @@ fn handle_tool_call(store: &SessionStore, params: &Value) -> std::result::Result
                 .map_err(|e| (-32000, e.to_string()))?;
             Ok(tool_text(format!("speaker_updated={updated}")))
         }
+        "get_live_transcript" => {
+            let last_n = args.get("last_n").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
+            let Some(session) = store.latest_session().map_err(|e| (-32000, e.to_string()))? else {
+                return Ok(tool_text("No active or recent transcription sessions.".to_string()));
+            };
+            let total = session.utterances.len();
+            let start_idx = total.saturating_sub(last_n.min(200));
+            let lines: Vec<String> = session.utterances[start_idx..]
+                .iter()
+                .map(|u| {
+                    let label = session
+                        .speakers
+                        .get(&u.speaker_id)
+                        .map(|s| s.label.as_str())
+                        .unwrap_or(&u.speaker_id);
+                    format_live_utterance_md(label, u)
+                })
+                .collect();
+            Ok(tool_text(wrap_untrusted_transcript(&lines.join("\n"))))
+        }
+        "start_session" => {
+            let cfg = mimir_core::MimirConfig::load_or_default().unwrap_or_default();
+            let pid_path = cfg.data_dir.join("mimir.pid");
+            if pid_path.exists() {
+                return Ok(tool_text("session_already_running=true".to_string()));
+            }
+            let exe = std::env::current_exe().map_err(|e| (-32000, e.to_string()))?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("start").arg("--serve");
+            if let Some(title) = args.get("title").and_then(|v| v.as_str())
+                && !title.trim().is_empty()
+            {
+                cmd.arg("--title").arg(title.trim());
+            }
+            if args.get("diarize_mic").and_then(|v| v.as_bool()).unwrap_or(false) {
+                cmd.arg("--diarize-mic");
+            }
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let child = cmd.spawn().map_err(|e| (-32000, e.to_string()))?;
+            Ok(tool_text(format!("started_pid={}", child.id())))
+        }
+        "stop_session" => {
+            let cfg = mimir_core::MimirConfig::load_or_default().unwrap_or_default();
+            let pid_path = cfg.data_dir.join("mimir.pid");
+            let Ok(pid_raw) = std::fs::read_to_string(&pid_path) else {
+                return Ok(tool_text("no_active_session=true".to_string()));
+            };
+            let pid: i32 = pid_raw.trim().parse().map_err(|e| (-32000, format!("bad pid: {e}")))?;
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .arg("-INT")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            Ok(tool_text(format!("signaled_stop_pid={pid}")))
+        }
+        "set_keywords" => {
+            let kws: Vec<String> = args
+                .get("keywords")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut cfg = mimir_core::MimirConfig::load_or_default().unwrap_or_default();
+            cfg.keywords = kws.clone();
+            let cfg_path = mimir_core::MimirConfig::config_path(&cfg.data_dir);
+            if let Some(parent) = cfg_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let json_str = serde_json::to_string_pretty(&cfg).map_err(|e| (-32000, e.to_string()))?;
+            std::fs::write(&cfg_path, json_str).map_err(|e| (-32000, e.to_string()))?;
+            Ok(tool_text(format!("keywords_count={}", kws.len())))
+        }
         unknown => Err((-32602, format!("unknown tool: {unknown}"))),
     }
 }
 
 fn handle_resources_list(store: &SessionStore) -> std::result::Result<Value, (i32, String)> {
     let sessions = store.list_sessions(10).map_err(|e| (-32000, e.to_string()))?;
-    let mut resources = vec![json!({
-        "uri": "mimir://sessions/latest",
-        "name": "Latest Mimir Transcript",
-        "mimeType": "text/markdown"
-    })];
+    let mut resources = vec![
+        json!({
+            "uri": "mimir://live",
+            "name": "Live / Latest Mimir Transcript Stream",
+            "mimeType": "text/markdown"
+        }),
+        json!({
+            "uri": "mimir://sessions/latest",
+            "name": "Latest Mimir Transcript",
+            "mimeType": "text/markdown"
+        }),
+    ];
     for s in sessions {
         resources.push(json!({
             "uri": format!("mimir://sessions/{}", s.id),
@@ -275,7 +399,7 @@ fn handle_resource_read(store: &SessionStore, params: &Value) -> std::result::Re
         .and_then(|v| v.as_str())
         .ok_or((-32602, "missing resource uri".to_string()))?;
 
-    let session = if uri == "mimir://sessions/latest" {
+    let session = if uri == "mimir://sessions/latest" || uri == "mimir://live" {
         store.latest_session().map_err(|e| (-32000, e.to_string()))?
     } else if let Some(id_str) = uri.strip_prefix("mimir://sessions/") {
         let uuid = Uuid::parse_str(id_str).map_err(|e| (-32602, e.to_string()))?;

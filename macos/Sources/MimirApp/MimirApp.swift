@@ -117,6 +117,28 @@ private struct MimirPrismMark: View {
     }
 }
 
+private struct SegmentedMeter: View {
+    let label: String
+    let level: Double
+    let activeColor: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(MimirTheme.textMuted)
+            let lit = Int(ceil(min(max(level, 0), 1) * 6.0))
+            HStack(spacing: 2) {
+                ForEach(0..<6, id: \.self) { idx in
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(idx < lit ? activeColor : MimirTheme.hairline)
+                        .frame(width: 3, height: 10)
+                }
+            }
+        }
+    }
+}
+
 struct MainView: View {
     @ObservedObject var controller: MimirController
     @State private var section: WorkspaceSection = .live
@@ -145,6 +167,9 @@ struct MainView: View {
                 .background(controller.isRecording ? MimirTheme.activeFill : MimirTheme.cardBg)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
                 .clipShape(RoundedRectangle(cornerRadius: 5))
+
+                SegmentedMeter(label: "MIC", level: controller.micActivity, activeColor: MimirTheme.cyan)
+                SegmentedMeter(label: "SYS", level: controller.sysActivity, activeColor: MimirTheme.azure)
 
                 Spacer()
 
@@ -298,6 +323,8 @@ private struct LeftControlRail: View {
                 Toggle("System Audio", isOn: $controller.captureSystemAudio)
                     .disabled(controller.isRecording)
                 Toggle("Multi-Speaker Mic", isOn: $controller.diarizeMic)
+                    .disabled(controller.isRecording)
+                Toggle("Save Local WAVs", isOn: $controller.saveWav)
                     .disabled(controller.isRecording)
             }
             .font(.system(size: 12))
@@ -457,6 +484,77 @@ struct SessionsTab: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
+                TextField("Search transcripts (FTS5)…", text: $controller.searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundStyle(MimirTheme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(MimirTheme.cardBg)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+                    .onSubmit { controller.runSearch() }
+
+                Button("Search") {
+                    controller.runSearch()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.elevatedBg)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+
+                if !controller.searchResults.isEmpty {
+                    Button("Clear") {
+                        controller.clearSearch()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(MimirTheme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(MimirTheme.cardBg)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                }
+            }
+
+            if !controller.searchResults.isEmpty {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(controller.searchResults) { hit in
+                            Button {
+                                controller.selectSession(hit.session_id)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text(hit.session_title ?? "Untitled")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(MimirTheme.ice)
+                                    Text("\(hit.speaker_label):")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(MimirTheme.cyan)
+                                    Text(hit.text)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(MimirTheme.textPrimary)
+                                        .lineLimit(1)
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(MimirTheme.cardBg)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: 120)
+                .padding(6)
+                .background(MimirTheme.railBg)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+            }
+
+            HStack(spacing: 8) {
                 TextField("Session title…", text: $controller.selectedTitleEdit)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12.5, weight: .medium))
@@ -523,6 +621,45 @@ struct SessionsTab: View {
                 .background(MimirTheme.activeFill)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
                 .disabled(controller.selectedTranscript.isEmpty)
+            }
+
+            HStack(spacing: 8) {
+                TextField("Speaker ID (e.g. spk_1)", text: $controller.speakerIdEdit)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(MimirTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(width: 150)
+                    .background(MimirTheme.cardBg)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                    .disabled(selectedSummary == nil)
+
+                TextField("New speaker name", text: $controller.speakerLabelEdit)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(MimirTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(width: 180)
+                    .background(MimirTheme.cardBg)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                    .disabled(selectedSummary == nil)
+                    .onSubmit { controller.renameSpeakerInline() }
+
+                Button("Rename Speaker") {
+                    controller.renameSpeakerInline()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.elevatedBg)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                .disabled(selectedSummary == nil)
+
+                Spacer()
             }
 
             ScrollView {
