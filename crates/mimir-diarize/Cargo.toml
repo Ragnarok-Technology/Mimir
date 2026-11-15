@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 mimir-core = { path = "../mimir-core" }
 serde.workspace = true
+tract-onnx.workspace = true
 uuid.workspace = true

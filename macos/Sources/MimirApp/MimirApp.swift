@@ -11,6 +11,7 @@ struct MimirMacApp: App {
                 .frame(minWidth: 780, minHeight: 520)
                 .preferredColorScheme(.dark)
         }
+        .defaultSize(width: 1080, height: 700)
 
         MenuBarExtra {
             Button(controller.isRecording ? "Stop Recording" : "Start Recording") {
@@ -25,6 +26,7 @@ struct MimirMacApp: App {
             }
             Divider()
             Button("Quit Mimir") {
+                controller.shutdownSync()
                 NSApplication.shared.terminate(nil)
             }
         } label: {
@@ -59,6 +61,51 @@ private func makeMenuBarTemplateIcon(isRecording: Bool) -> NSImage {
     }
     image.isTemplate = true
     return image
+}
+
+private struct WrappingHStack: Layout {
+    var horizontalSpacing: CGFloat = 8
+    var verticalSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var totalWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                totalWidth = max(totalWidth, x - horizontalSpacing)
+                x = 0
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            x += size.width + horizontalSpacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        totalWidth = max(totalWidth, max(0, x - horizontalSpacing))
+        return CGSize(width: proposal.width ?? totalWidth, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + horizontalSpacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
 }
 
 private enum MimirTheme {
@@ -326,6 +373,8 @@ private struct LeftControlRail: View {
                     .disabled(controller.isRecording)
                 Toggle("Save Local WAVs", isOn: $controller.saveWav)
                     .disabled(controller.isRecording)
+                Toggle("Post-Process Cleanup", isOn: $controller.enableCleanup)
+                    .disabled(controller.isRecording)
                 Toggle("Auto-Detect Calls", isOn: $controller.autoDetectCalls)
             }
             .font(.system(size: 12))
@@ -555,13 +604,14 @@ struct SessionsTab: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
             }
 
-            HStack(spacing: 8) {
+            WrappingHStack(horizontalSpacing: 8, verticalSpacing: 8) {
                 TextField("Session title…", text: $controller.selectedTitleEdit)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(MimirTheme.textPrimary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
+                    .frame(minWidth: 160, idealWidth: 220, maxWidth: 280)
                     .background(MimirTheme.cardBg)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
                     .disabled(selectedSummary == nil)
@@ -571,6 +621,8 @@ struct SessionsTab: View {
                     controller.renameSelectedSession()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.textPrimary)
                 .padding(.horizontal, 10)
@@ -583,6 +635,8 @@ struct SessionsTab: View {
                     controller.toggleArchiveSelectedSession()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.textSecondary)
                 .padding(.horizontal, 10)
@@ -595,6 +649,8 @@ struct SessionsTab: View {
                     confirmDelete = true
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(Color.red.opacity(0.9))
                 .padding(.horizontal, 10)
@@ -611,10 +667,51 @@ struct SessionsTab: View {
                     Text("This permanently deletes the transcript and its local search index.")
                 }
 
+                Picker("View", selection: $controller.transcriptViewMode) {
+                    Text("Cleaned").tag("cleaned")
+                    Text("Raw").tag("raw")
+                    Text("Diff").tag("diff")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 190)
+                .fixedSize(horizontal: true, vertical: false)
+                .disabled(selectedSummary == nil)
+
+                Button(controller.isCleaningSession ? "Cleaning…" : "Run Cleanup") {
+                    controller.cleanupSelectedSession()
+                }
+                .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.cyan)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.elevatedBg)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.cyan.opacity(0.5), lineWidth: 1))
+                .disabled(selectedSummary == nil || controller.isCleaningSession)
+
+                Button("Revert Raw") {
+                    controller.revertSelectedSession()
+                }
+                .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.textSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                .disabled(selectedSummary == nil || controller.isCleaningSession)
+
                 Button("Copy Markdown") {
                     controller.copySelectedTranscript()
                 }
                 .buttonStyle(.plain)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(MimirTheme.ice)
                 .padding(.horizontal, 10)
@@ -622,6 +719,32 @@ struct SessionsTab: View {
                 .background(MimirTheme.activeFill)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
                 .disabled(controller.selectedTranscript.isEmpty)
+            }
+
+            if controller.isCleaningSession {
+                HStack(spacing: 10) {
+                    if controller.cleanupTotal > 0 {
+                        ProgressView(
+                            value: Double(controller.cleanupDone),
+                            total: Double(controller.cleanupTotal)
+                        )
+                        .progressViewStyle(.linear)
+                        .tint(MimirTheme.cyan)
+                        Text("\(controller.cleanupDone) / \(controller.cleanupTotal)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.cyan)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading Qwen 2.5 0.5B…")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.cyan.opacity(0.35), lineWidth: 1))
             }
 
             HStack(spacing: 8) {
@@ -712,18 +835,62 @@ struct AssistantsTab: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("WHISTLE MODEL & UPDATES")
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(MimirTheme.textMuted)
                 HStack {
-                    Button("Download / Verify whistle.cact (16.9 MB)") {
-                        controller.fetchModel()
-                    }
+                    Text("LOCAL AI MODELS & UPDATES")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(MimirTheme.textMuted)
                     Spacer()
+                    Button("Download All") {
+                        controller.fetchModel("all")
+                    }
+                    .disabled(controller.activeModelTaskId != nil)
+                    Button("Refresh") {
+                        controller.refreshModelStatuses()
+                    }
                     Button("Check for App Updates…") {
                         controller.checkForUpdates()
                     }
                 }
+
+                ForEach(controller.modelStatuses) { model in
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(model.installed ? Color.green : MimirTheme.textMuted.opacity(0.4))
+                            .frame(width: 8, height: 8)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.name)
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(MimirTheme.textPrimary)
+                            Text(
+                                model.installed
+                                    ? String(format: "Installed (%.1f MB)", Double(model.size_bytes) / (1024.0 * 1024.0))
+                                    : "Not installed (\(model.expected_size_label))"
+                            )
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                        }
+                        Spacer()
+                        if controller.activeModelTaskId == model.id || controller.activeModelTaskId == "all" {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Button(model.installed ? "Verify" : "Download") {
+                            controller.fetchModel(model.id)
+                        }
+                        .disabled(controller.activeModelTaskId != nil)
+                        if model.installed {
+                            Button("Delete") {
+                                controller.deleteModel(model.id)
+                            }
+                            .foregroundStyle(Color.red.opacity(0.9))
+                            .disabled(controller.activeModelTaskId != nil)
+                        }
+                    }
+                    .padding(8)
+                    .background(MimirTheme.voidBg)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+                }
+
                 if !controller.updateMessage.isEmpty {
                     HStack {
                         Text(controller.updateMessage)
@@ -735,6 +902,9 @@ struct AssistantsTab: View {
                         }
                     }
                 }
+            }
+            .onAppear {
+                controller.refreshModelStatuses()
             }
             .padding(14)
             .background(MimirTheme.cardBg)

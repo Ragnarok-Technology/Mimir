@@ -3,10 +3,12 @@
 pub mod bleed;
 pub mod capture;
 pub mod resampler;
+pub mod silero;
 pub mod vad;
 
 pub use bleed::BleedGate;
 pub use capture::{CaptureHandle, CapturedFrame, list_audio_devices, start_dual_capture};
 pub use mimir_core::{AudioChunk, ChannelId, WHISTLE_SAMPLE_RATE};
 pub use resampler::AudioNormalizer;
+pub use silero::SileroVadOnnx;
 pub use vad::VadChunker;

@@ -14,11 +14,21 @@ struct MimirSearchHit: Identifiable, Decodable {
     var id: String { utterance_id }
 }
 
+struct MimirModelStatus: Identifiable, Decodable {
+    let id: String
+    let name: String
+    let installed: Bool
+    let size_bytes: UInt64
+    let expected_size_label: String
+    let path: String
+}
+
 @MainActor
 final class MimirController: ObservableObject {
     @Published var isRecording = false
     @Published var diarizeMic = false
     @Published var saveWav = false
+    @Published var enableCleanup = false
     @Published var autoDetectCalls = false {
         didSet { updateAutoDetectMonitor() }
     }
@@ -41,6 +51,18 @@ final class MimirController: ObservableObject {
     @Published var connectReport = ""
     @Published var updateMessage = ""
     @Published var updateDownloadURL: URL?
+    @Published var modelStatuses: [MimirModelStatus] = []
+    @Published var activeModelTaskId: String?
+    @Published var isCleaningSession = false
+    @Published var cleanupDone = 0
+    @Published var cleanupTotal = 0
+    @Published var transcriptViewMode = "cleaned" {
+        didSet {
+            if let sid = selectedSessionId {
+                selectSession(sid)
+            }
+        }
+    }
 
     private var recordProcess: Process?
     private var stdinPipe: Pipe?
@@ -48,6 +70,7 @@ final class MimirController: ObservableObject {
     private var liveStdoutBuffer = ""
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
+    private var terminationObserver: NSObjectProtocol?
     private var autoDetectTask: Task<Void, Never>?
     private var wasAudioActiveBeforeStop = false
 
@@ -70,6 +93,15 @@ final class MimirController: ObservableObject {
     init() {
         refreshSessions()
         installHotkeys()
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.shutdownSync()
+            }
+        }
     }
 
     private func installHotkeys() {
@@ -118,6 +150,9 @@ final class MimirController: ObservableObject {
         }
         if saveWav {
             args.append("--save-wav")
+        }
+        if enableCleanup {
+            args.append("--cleanup")
         }
         for kw in keywordsText.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !kw.isEmpty {
             args += ["--keyword", kw]
@@ -210,19 +245,64 @@ final class MimirController: ObservableObject {
     }
 
     func stopRecording() {
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        let tap = systemTap
+        systemTap = nil
         Task {
-            await systemTap?.stop()
-            systemTap = nil
-            try? stdinPipe?.fileHandleForWriting.close()
-            stdinPipe = nil
+            await tap?.stop()
         }
         if let proc = recordProcess, proc.isRunning {
-            kill(proc.processIdentifier, SIGINT)
+            let pid = proc.processIdentifier
+            kill(pid, SIGINT)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0) {
+                if proc.isRunning {
+                    kill(pid, SIGTERM)
+                }
+            }
         }
         micActivity = 0
         sysActivity = 0
         wasAudioActiveBeforeStop = true
         statusMessage = "Finalizing transcript…"
+    }
+
+    /// Synchronously stops capture and waits briefly for `mimir-cli` to release
+    /// the microphone and flush SQLite before the app terminates.
+    func shutdownSync() {
+        autoDetectTask?.cancel()
+        autoDetectTask = nil
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        let tap = systemTap
+        systemTap = nil
+        if let tap {
+            Task {
+                await tap.stop()
+            }
+        }
+        if let proc = recordProcess, proc.isRunning {
+            let pid = proc.processIdentifier
+            kill(pid, SIGINT)
+            let deadline = Date().addingTimeInterval(1.5)
+            while proc.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if proc.isRunning {
+                proc.terminate()
+                let termDeadline = Date().addingTimeInterval(0.5)
+                while proc.isRunning && Date() < termDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            if proc.isRunning {
+                kill(pid, SIGKILL)
+            }
+        }
+        recordProcess = nil
+        isRecording = false
+        micActivity = 0
+        sysActivity = 0
     }
 
     private func updateAutoDetectMonitor() {
@@ -365,7 +445,7 @@ final class MimirController: ObservableObject {
             selectedTitleEdit = match.title == "Untitled" ? "" : match.title
         }
         Task {
-            let md = await runCli(["export", id, "--format", "md"])
+            let md = await runCli(["export", id, "--format", "md", "--view", transcriptViewMode])
             self.selectedTranscript = md
         }
     }
@@ -436,11 +516,117 @@ final class MimirController: ObservableObject {
         }
     }
 
-    func fetchModel() {
-        statusMessage = "Fetching whistle.cact (16.9 MB)…"
+    func refreshModelStatuses() {
         Task {
-            let output = await runCli(["fetch"])
-            self.statusMessage = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let output = await runCli(["models", "status", "--json"])
+            if let data = output.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([MimirModelStatus].self, from: data)
+            {
+                self.modelStatuses = decoded
+            }
+        }
+    }
+
+    func fetchModel(_ id: String = "whistle") {
+        activeModelTaskId = id
+        let flag: [String]
+        switch id {
+        case "qwen":
+            statusMessage = "Downloading Qwen 2.5 0.5B Instruct (475 MB)…"
+            flag = ["fetch", "--qwen"]
+        case "silero_vad", "speaker_embed", "onnx":
+            statusMessage = "Downloading ONNX VAD & Speaker Embedding models…"
+            flag = ["fetch", "--onnx"]
+        case "all":
+            statusMessage = "Downloading all local Mimir models…"
+            flag = ["fetch", "--all"]
+        default:
+            statusMessage = "Fetching whistle.cact (16.9 MB)…"
+            flag = ["fetch"]
+        }
+        Task {
+            let output = await runCli(flag)
+            self.activeModelTaskId = nil
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed.components(separatedBy: "\n").last ?? trimmed
+            }
+            self.refreshModelStatuses()
+        }
+    }
+
+    func deleteModel(_ id: String) {
+        activeModelTaskId = id
+        statusMessage = "Removing \(id)…"
+        Task {
+            let output = await runCli(["models", "delete", id])
+            self.activeModelTaskId = nil
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.refreshModelStatuses()
+        }
+    }
+
+    func revertSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        statusMessage = "Reverting transcript to raw Whistle text…"
+        Task {
+            let output = await runCli(["revert", sid])
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.selectSession(sid)
+        }
+    }
+
+    func cleanupSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        isCleaningSession = true
+        cleanupDone = 0
+        cleanupTotal = 0
+        statusMessage = "Running local Qwen transcript cleanup…"
+        let bin = mimirBinaryURL
+        Task {
+            let output: String = await withCheckedContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let proc = Process()
+                    proc.executableURL = bin
+                    proc.arguments = ["cleanup", sid, "--progress"]
+                    let outPipe = Pipe()
+                    let errPipe = Pipe()
+                    proc.standardOutput = outPipe
+                    proc.standardError = errPipe
+
+                    errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                        let data = handle.availableData
+                        guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                        for line in chunk.components(separatedBy: .newlines) where line.hasPrefix("PROGRESS:") {
+                            let parts = line.split(separator: ":")
+                            if parts.count == 3, let d = Int(parts[1]), let t = Int(parts[2]) {
+                                Task { @MainActor [weak self] in
+                                    self?.cleanupDone = d
+                                    self?.cleanupTotal = t
+                                }
+                            }
+                        }
+                    }
+
+                    try? proc.run()
+                    proc.waitUntilExit()
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    cont.resume(returning: String(data: outData, encoding: .utf8) ?? "")
+                }
+            }
+            self.isCleaningSession = false
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.selectSession(sid)
         }
     }
 
