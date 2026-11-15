@@ -39,31 +39,119 @@ pub fn sanitize_cleanup_edit(raw: &str, candidate: &str) -> String {
     cand_t.to_string()
 }
 
-/// Deterministic, sub-millisecond keyword casing & close-typo repair.
+/// Deterministic, sub-millisecond ASR stutter/casing cleanup + keyword casing & phrase repair.
 pub fn apply_keyword_phonetic_cleanup(raw: &str, keywords: &[String]) -> String {
-    if keywords.is_empty() || raw.trim().is_empty() {
-        return raw.to_string();
-    }
-    let single_kws: Vec<&str> = keywords
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && !s.contains(' '))
-        .collect();
-    if single_kws.is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return raw.to_string();
     }
 
+    // 1. Collapse immediate duplicate words (e.g. "the the", "in, in") and capitalize sentence start.
+    let mut deduped: Vec<String> = Vec::new();
+    for tok in trimmed.split_whitespace() {
+        let cur_core = tok.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+        if let Some(prev) = deduped.last() {
+            let prev_core = prev.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+            if !cur_core.is_empty() && cur_core == prev_core && prev.ends_with(',') {
+                *deduped.last_mut().unwrap() = tok.to_string();
+                continue;
+            }
+            if !cur_core.is_empty() && cur_core == prev_core && !prev.ends_with(['.', '!', '?']) {
+                continue;
+            }
+        }
+        deduped.push(tok.to_string());
+    }
+    if let Some(first) = deduped.first_mut() {
+        let mut chars = first.chars();
+        if let Some(c) = chars.next()
+            && c.is_ascii_lowercase()
+        {
+            *first = format!("{}{}", c.to_ascii_uppercase(), chars.as_str());
+        }
+    }
+    let stage = deduped.join(" ");
+
+    if keywords.is_empty() {
+        return stage;
+    }
+
+    // 2. Multi-word keyword phrase matching (2-3 word sliding window, e.g. "L through Harris" -> "L3Harris", "Strong Duffy" -> "Sean Duffy")
+    let mut tokens: Vec<String> = stage.split_whitespace().map(|s| s.to_string()).collect();
+    let all_kws: Vec<&str> = keywords
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut matched_span = 0usize;
+        let mut matched_kw: Option<&str> = None;
+        for span in [3usize, 2usize] {
+            if i + span <= tokens.len() {
+                let window_raw = tokens[i..i + span].join(" ");
+                let window_norm: String = window_raw
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                for &kw in &all_kws {
+                    let kw_norm: String = kw
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    let kw_compact: String = kw_norm.split_whitespace().collect();
+                    let win_compact: String = window_norm.split_whitespace().collect();
+                    let min_sim = if span >= 3 { 0.84 } else { 0.78 };
+                    if win_compact == kw_compact
+                        || (kw_compact.len() >= 6
+                            && win_compact.len().abs_diff(kw_compact.len()) <= 2
+                            && char_similarity(&win_compact, &kw_compact) >= min_sim)
+                    {
+                        matched_span = span;
+                        matched_kw = Some(kw);
+                        break;
+                    }
+                }
+            }
+            if matched_kw.is_some() {
+                break;
+            }
+        }
+        if let Some(kw) = matched_kw {
+            let last_tok = &tokens[i + matched_span - 1];
+            let suffix: String = last_tok
+                .chars()
+                .rev()
+                .take_while(|c| !c.is_alphanumeric())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            tokens.splice(i..i + matched_span, [format!("{kw}{suffix}")]);
+        }
+        i += 1;
+    }
+
+    // 3. Single-word keyword casing & close phonetic repair
+    let single_kws: Vec<&str> = all_kws.into_iter().filter(|s| !s.contains(' ')).collect();
+    if single_kws.is_empty() {
+        return tokens.join(" ");
+    }
+
     let mut out_tokens = Vec::new();
-    for tok in raw.split_whitespace() {
+    for tok in tokens {
         let prefix_len = tok
             .find(|c: char| c.is_alphanumeric())
             .unwrap_or(tok.len());
         let suffix_start = tok
             .rfind(|c: char| c.is_alphanumeric())
-            .map(|i| i + tok[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
+            .map(|idx| idx + tok[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
             .unwrap_or(prefix_len);
         if suffix_start <= prefix_len {
-            out_tokens.push(tok.to_string());
+            out_tokens.push(tok);
             continue;
         }
         let prefix = &tok[..prefix_len];
@@ -90,7 +178,7 @@ pub fn apply_keyword_phonetic_cleanup(raw: &str, keywords: &[String]) -> String 
         if let Some(rep) = replacement {
             out_tokens.push(format!("{prefix}{rep}{suffix}"));
         } else {
-            out_tokens.push(tok.to_string());
+            out_tokens.push(tok);
         }
     }
     out_tokens.join(" ")
@@ -209,11 +297,11 @@ mod tests {
 
     #[test]
     fn keyword_cleanup_fixes_casing_and_close_phonetic_typos() {
-        let raw = "Now, why is eram important for L3Haris?";
+        let raw = "now, why is eram important for L3Haris and in, in L3 Harris?";
         let kws = vec!["ERAM".into(), "L3Harris".into()];
         assert_eq!(
             apply_keyword_phonetic_cleanup(raw, &kws),
-            "Now, why is ERAM important for L3Harris?"
+            "Now, why is ERAM important for L3Harris and in L3Harris?"
         );
     }
 
