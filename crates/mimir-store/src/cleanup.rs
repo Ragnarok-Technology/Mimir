@@ -36,9 +36,12 @@ pub fn sanitize_cleanup_edit(raw: &str, candidate: &str) -> String {
 
     let raw_words = raw_trimmed.split_whitespace().count();
     let new_words = cleaned.split_whitespace().count();
+    if raw_words <= 3 && new_words < raw_words {
+        return raw_trimmed.to_string();
+    }
     if raw_words >= 4 {
         let ratio = new_words as f32 / raw_words as f32;
-        if !(0.4..=1.8).contains(&ratio) {
+        if !(0.55..=1.6).contains(&ratio) {
             return raw_trimmed.to_string();
         }
     }
@@ -82,6 +85,17 @@ pub fn basic_heuristic_cleanup(raw: &str, keywords: &[String]) -> String {
 
 /// Builds the system and user prompt pair for Qwen 2.5 0.5B Instruct transcript cleanup.
 pub fn build_qwen_cleanup_prompt(raw: &str, keywords: &[String]) -> (String, String) {
+    build_qwen_cleanup_prompt_with_context(None, raw, None, keywords)
+}
+
+/// Builds a context-aware prompt using neighboring utterances so Qwen can resolve
+/// phonetic ASR mishearings without dropping words or changing meaning.
+pub fn build_qwen_cleanup_prompt_with_context(
+    prev: Option<&str>,
+    raw: &str,
+    next: Option<&str>,
+    keywords: &[String],
+) -> (String, String) {
     let kw_hint = if keywords.is_empty() {
         String::new()
     } else {
@@ -91,9 +105,17 @@ pub fn build_qwen_cleanup_prompt(raw: &str, keywords: &[String]) -> (String, Str
         )
     };
     let system = format!(
-        "You are a conservative speech-to-text transcript editor. Fix obvious phonetic mishearings, punctuation, and capitalization while preserving the speaker's exact meaning and wording.{kw_hint} Output ONLY the corrected transcript line with no explanations or quotes."
+        "You are a conservative speech-to-text transcript editor. Fix obvious phonetic ASR mishearings, split compound words, punctuation, and capitalization while keeping every spoken word (do not drop leading words like 'or', 'and', or 'so').{kw_hint} Use Previous/Next only as context and output ONLY the corrected Target line with no quotes or labels."
     );
-    (system, raw.trim().to_string())
+    let mut user = String::new();
+    if let Some(p) = prev.map(str::trim).filter(|s| !s.is_empty()) {
+        user.push_str(&format!("Previous: {p}\n"));
+    }
+    user.push_str(&format!("Target: {}", raw.trim()));
+    if let Some(n) = next.map(str::trim).filter(|s| !s.is_empty()) {
+        user.push_str(&format!("\nNext: {n}"));
+    }
+    (system, user)
 }
 
 #[cfg(test)]

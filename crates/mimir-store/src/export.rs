@@ -15,7 +15,17 @@ pub fn render_session(session: &Session, format: TranscriptFormat) -> Result<Str
     }
 }
 
-pub fn render_markdown(session: &Session) -> String {
+/// Selects which text representation to render in Markdown exports and UI views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptView {
+    #[default]
+    Cleaned,
+    Raw,
+    Diff,
+}
+
+/// Renders a `Session` into Markdown using the specified `TranscriptView`.
+pub fn render_markdown_with_view(session: &Session, view: TranscriptView) -> String {
     let mut out = String::new();
     let title = session.title.as_deref().unwrap_or("Untitled Session");
     let _ = writeln!(out, "# {title}");
@@ -43,10 +53,31 @@ pub fn render_markdown(session: &Session) -> String {
             .map(|s| s.label.as_str())
             .unwrap_or(&u.speaker_id);
         let ts = format_hhmmss(u.start_ms);
-        let _ = writeln!(out, "[{ts}] **{speaker_label}:** {}", u.text.trim());
+        match view {
+            TranscriptView::Cleaned => {
+                let _ = writeln!(out, "[{ts}] **{speaker_label}:** {}", u.text.trim());
+            }
+            TranscriptView::Raw => {
+                let raw = u.raw_text.as_deref().unwrap_or(&u.text).trim();
+                let _ = writeln!(out, "[{ts}] **{speaker_label}:** {raw}");
+            }
+            TranscriptView::Diff => {
+                if let Some(raw) = &u.raw_text {
+                    let _ = writeln!(out, "[{ts}] **{speaker_label}:**");
+                    let _ = writeln!(out, "  - raw:     {}", raw.trim());
+                    let _ = writeln!(out, "  - cleaned: {}", u.text.trim());
+                } else {
+                    let _ = writeln!(out, "[{ts}] **{speaker_label}:** {}", u.text.trim());
+                }
+            }
+        }
     }
 
     out
+}
+
+pub fn render_markdown(session: &Session) -> String {
+    render_markdown_with_view(session, TranscriptView::Cleaned)
 }
 
 fn render_jsonl(session: &Session) -> Result<String> {

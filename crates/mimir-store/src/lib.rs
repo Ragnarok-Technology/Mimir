@@ -401,10 +401,28 @@ impl SessionStore {
         &self,
         session_id: Uuid,
         mut cleaner: F,
-        mut on_progress: P,
+        on_progress: P,
     ) -> Result<usize>
     where
         F: FnMut(&Utterance) -> Result<Option<String>>,
+        P: FnMut(usize, usize),
+    {
+        self.cleanup_session_with_context_and_progress(
+            session_id,
+            |utt, _prev, _next| cleaner(utt),
+            on_progress,
+        )
+    }
+
+    /// Runs a context-aware cleanup callback `(utterance, prev_raw, next_raw)` across a session.
+    pub fn cleanup_session_with_context_and_progress<F, P>(
+        &self,
+        session_id: Uuid,
+        mut cleaner: F,
+        mut on_progress: P,
+    ) -> Result<usize>
+    where
+        F: FnMut(&Utterance, Option<&str>, Option<&str>) -> Result<Option<String>>,
         P: FnMut(usize, usize),
     {
         let Some(session) = self.get_session(session_id)? else {
@@ -415,7 +433,15 @@ impl SessionStore {
         let mut updated = 0usize;
         for (idx, utt) in session.utterances.iter().enumerate() {
             let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
-            if let Some(cleaned) = cleaner(utt)? {
+            let prev = idx
+                .checked_sub(1)
+                .and_then(|i| session.utterances.get(i))
+                .map(|u| u.raw_text.as_deref().unwrap_or(&u.text));
+            let next = session
+                .utterances
+                .get(idx + 1)
+                .map(|u| u.raw_text.as_deref().unwrap_or(&u.text));
+            if let Some(cleaned) = cleaner(utt, prev, next)? {
                 let cleaned = cleaned.trim();
                 if !cleaned.is_empty() && cleaned != utt.text {
                     self.update_utterance_text(utt.id, cleaned, Some(source))?;
@@ -425,6 +451,33 @@ impl SessionStore {
             on_progress(idx + 1, total);
         }
         Ok(updated)
+    }
+
+    /// Reverts all cleaned utterances in a session back to their original `raw_text`.
+    pub fn revert_session_cleanup(&self, session_id: Uuid) -> Result<usize> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Err(MimirError::Storage(format!("session {session_id} not found")));
+        };
+        let mut reverted = 0usize;
+        for utt in &session.utterances {
+            if let Some(raw) = &utt.raw_text {
+                let uid = utt.id.to_string();
+                self.conn
+                    .execute(
+                        "UPDATE utterances SET text = ?1, raw_text = NULL WHERE id = ?2",
+                        params![raw, &uid],
+                    )
+                    .map_err(|e| MimirError::Storage(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "UPDATE utterances_fts SET text = ?1 WHERE utterance_id = ?2",
+                        params![raw, &uid],
+                    )
+                    .map_err(|e| MimirError::Storage(e.to_string()))?;
+                reverted += 1;
+            }
+        }
+        Ok(reverted)
     }
 
     /// Permanently deletes a session, its utterances, FTS index entries, and JSONL WAL file.

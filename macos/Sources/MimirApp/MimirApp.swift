@@ -613,6 +613,16 @@ struct SessionsTab: View {
                     Text("This permanently deletes the transcript and its local search index.")
                 }
 
+                Picker("View", selection: $controller.transcriptViewMode) {
+                    Text("Cleaned").tag("cleaned")
+                    Text("Raw").tag("raw")
+                    Text("Diff").tag("diff")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 190)
+                .disabled(selectedSummary == nil)
+
                 Button(controller.isCleaningSession ? "Cleaning…" : "Run Cleanup") {
                     controller.cleanupSelectedSession()
                 }
@@ -623,6 +633,18 @@ struct SessionsTab: View {
                 .padding(.vertical, 5)
                 .background(MimirTheme.elevatedBg)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.cyan.opacity(0.5), lineWidth: 1))
+                .disabled(selectedSummary == nil || controller.isCleaningSession)
+
+                Button("Revert Raw") {
+                    controller.revertSelectedSession()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.textSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
                 .disabled(selectedSummary == nil || controller.isCleaningSession)
 
                 Button("Copy Markdown") {

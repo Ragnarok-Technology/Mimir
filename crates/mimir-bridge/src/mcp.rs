@@ -141,7 +141,8 @@ fn tools_manifest() -> Value {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "UUID or 'latest'", "default": "latest" },
-                        "format": { "type": "string", "enum": ["markdown", "json", "jsonl", "srt"], "default": "markdown" }
+                        "format": { "type": "string", "enum": ["markdown", "json", "jsonl", "srt"], "default": "markdown" },
+                        "view": { "type": "string", "enum": ["cleaned", "raw", "diff"], "default": "cleaned", "description": "For markdown: show cleaned text, original Whistle raw_text, or a raw vs cleaned diff." }
                     }
                 }
             },
@@ -246,11 +247,21 @@ fn handle_tool_call(store: &SessionStore, params: &Value) -> std::result::Result
                 store.get_session(uuid).map_err(|e| (-32000, e.to_string()))?
             };
 
+            let view = match args.get("view").and_then(|v| v.as_str()).unwrap_or("cleaned") {
+                "raw" => mimir_store::export::TranscriptView::Raw,
+                "diff" => mimir_store::export::TranscriptView::Diff,
+                _ => mimir_store::export::TranscriptView::Cleaned,
+            };
+
             let Some(session) = session else {
                 return Ok(tool_text("No transcription sessions found.".to_string()));
             };
 
-            let rendered = render_session(&session, format).map_err(|e| (-32000, e.to_string()))?;
+            let rendered = if format == TranscriptFormat::Markdown {
+                mimir_store::export::render_markdown_with_view(&session, view)
+            } else {
+                render_session(&session, format).map_err(|e| (-32000, e.to_string()))?
+            };
             Ok(tool_text(wrap_untrusted_transcript(&rendered)))
         }
         "search_transcripts" => {

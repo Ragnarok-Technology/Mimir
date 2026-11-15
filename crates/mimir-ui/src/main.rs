@@ -5,12 +5,15 @@ use eframe::egui;
 use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
-use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, TranscriptFormat, Utterance};
+use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, Utterance};
 use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
 use mimir_store::cleanup::{
-    basic_heuristic_cleanup, build_qwen_cleanup_prompt, sanitize_cleanup_edit,
+    basic_heuristic_cleanup, build_qwen_cleanup_prompt_with_context, sanitize_cleanup_edit,
 };
-use mimir_store::{SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir, export::render_session};
+use mimir_store::{
+    SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir,
+    export::{TranscriptView, render_markdown_with_view},
+};
 use mimir_whistle::artifact::{
     delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model,
     fetch_silero_vad, fetch_speaker_embed, fetch_whistle_weights, model_statuses,
@@ -60,6 +63,7 @@ struct MimirDesktopApp {
     selected_title_edit: String,
     confirm_delete_id: Option<Uuid>,
     selected_markdown: String,
+    transcript_view: TranscriptView,
     search_query: String,
     search_results: Vec<SearchHit>,
     speaker_id_edit: String,
@@ -99,6 +103,7 @@ impl MimirDesktopApp {
             selected_title_edit: String::new(),
             confirm_delete_id: None,
             selected_markdown: String::new(),
+            transcript_view: TranscriptView::Cleaned,
             search_query: String::new(),
             search_results: Vec::new(),
             speaker_id_edit: String::new(),
@@ -143,9 +148,8 @@ impl MimirDesktopApp {
         }
         if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
             && let Ok(Some(session)) = store.get_session(id)
-            && let Ok(md) = render_session(&session, TranscriptFormat::Markdown)
         {
-            self.selected_markdown = md;
+            self.selected_markdown = render_markdown_with_view(&session, self.transcript_view);
         }
     }
 
@@ -794,13 +798,13 @@ impl eframe::App for MimirDesktopApp {
                                         None
                                     };
                                     let used_qwen = qwen.is_some();
-                                    let updated = store.cleanup_session_with_progress(
+                                    let updated = store.cleanup_session_with_context_and_progress(
                                         sel_id,
-                                        |utt| {
+                                        |utt, prev, next| {
                                             let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
                                             let base = basic_heuristic_cleanup(src, &kws);
                                             let cleaned = if let Some(q) = qwen.as_mut() {
-                                                let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
+                                                let (sys, usr) = build_qwen_cleanup_prompt_with_context(prev, &base, next, &kws);
                                                 match q.complete(&sys, &usr, 128) {
                                                     Ok(cand) => sanitize_cleanup_edit(&base, &cand),
                                                     Err(_) => base,
@@ -826,6 +830,24 @@ impl eframe::App for MimirDesktopApp {
                                 let _ = tx.send(UiEvent::CleanupDone);
                                 let _ = tx.send(UiEvent::Status(msg));
                             });
+                        }
+                        if ui.button("Revert Raw").clicked() {
+                            if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
+                                && let Ok(n) = store.revert_session_cleanup(sel_id)
+                            {
+                                self.status_line = format!("Reverted {n} utterance(s) to raw text.");
+                                self.load_session(sel_id);
+                            }
+                        }
+                        for (view, lbl) in [
+                            (TranscriptView::Cleaned, "Cleaned"),
+                            (TranscriptView::Raw, "Raw"),
+                            (TranscriptView::Diff, "Diff"),
+                        ] {
+                            if ui.selectable_label(self.transcript_view == view, lbl).clicked() {
+                                self.transcript_view = view;
+                                self.load_session(sel_id);
+                            }
                         }
                     });
                     if let Some((done, total)) = self.cleanup_progress {

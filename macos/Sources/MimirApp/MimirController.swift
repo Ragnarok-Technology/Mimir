@@ -56,6 +56,13 @@ final class MimirController: ObservableObject {
     @Published var isCleaningSession = false
     @Published var cleanupDone = 0
     @Published var cleanupTotal = 0
+    @Published var transcriptViewMode = "cleaned" {
+        didSet {
+            if let sid = selectedSessionId {
+                selectSession(sid)
+            }
+        }
+    }
 
     private var recordProcess: Process?
     private var stdinPipe: Pipe?
@@ -383,7 +390,7 @@ final class MimirController: ObservableObject {
             selectedTitleEdit = match.title == "Untitled" ? "" : match.title
         }
         Task {
-            let md = await runCli(["export", id, "--format", "md"])
+            let md = await runCli(["export", id, "--format", "md", "--view", transcriptViewMode])
             self.selectedTranscript = md
         }
     }
@@ -504,6 +511,19 @@ final class MimirController: ObservableObject {
                 self.statusMessage = trimmed
             }
             self.refreshModelStatuses()
+        }
+    }
+
+    func revertSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        statusMessage = "Reverting transcript to raw Whistle text…"
+        Task {
+            let output = await runCli(["revert", sid])
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.selectSession(sid)
         }
     }
 

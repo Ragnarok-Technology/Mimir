@@ -9,9 +9,12 @@ use mimir_bridge::mcp;
 use mimir_core::{MimirConfig, Session, TranscriptFormat};
 use mimir_diarize::{DiarizerConfig, OnnxSpeakerEmbedder};
 use mimir_store::cleanup::{
-    basic_heuristic_cleanup, build_qwen_cleanup_prompt, sanitize_cleanup_edit,
+    basic_heuristic_cleanup, build_qwen_cleanup_prompt_with_context, sanitize_cleanup_edit,
 };
-use mimir_store::{SessionStore, export::render_session};
+use mimir_store::{
+    SessionStore,
+    export::{TranscriptView, render_markdown_with_view, render_session},
+};
 use mimir_whistle::artifact::{
     delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model,
     fetch_silero_vad, fetch_speaker_embed, fetch_whistle_weights, model_statuses,
@@ -58,6 +61,23 @@ impl From<FormatArg> for TranscriptFormat {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ViewArg {
+    Cleaned,
+    Raw,
+    Diff,
+}
+
+impl From<ViewArg> for TranscriptView {
+    fn from(v: ViewArg) -> Self {
+        match v {
+            ViewArg::Cleaned => TranscriptView::Cleaned,
+            ViewArg::Raw => TranscriptView::Raw,
+            ViewArg::Diff => TranscriptView::Diff,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Show Mimir configuration, model/library paths, and local session count.
@@ -81,7 +101,10 @@ enum Commands {
         #[command(subcommand)]
         action: ModelsAction,
     },
-    /// Run local transcript cleanup (Qwen 2.5 0.5B Instruct + heuristics) on a past session.
+    /// Revert cleaned utterances in a session back to their original raw Whistle text.
+    Revert {
+        session_id: Uuid,
+    },
     Cleanup {
         session_id: Uuid,
         #[arg(long)]
@@ -165,6 +188,8 @@ enum Commands {
         session_id: Uuid,
         #[arg(long, value_enum, default_value_t = FormatArg::Md)]
         format: FormatArg,
+        #[arg(long, value_enum, default_value_t = ViewArg::Cleaned)]
+        view: ViewArg,
     },
     /// Full-text search across all local transcripts.
     Search {
@@ -324,6 +349,11 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Revert { session_id } => {
+            let store = SessionStore::open(&cfg.data_dir)?;
+            let reverted = store.revert_session_cleanup(session_id)?;
+            println!("Reverted {reverted} utterance(s) in session {session_id} to raw text.");
+        }
         Commands::Cleanup {
             session_id,
             json,
@@ -613,12 +643,22 @@ async fn main() -> Result<()> {
             }
             println!("{rendered}");
         }
-        Commands::Export { session_id, format } => {
+        Commands::Export {
+            session_id,
+            format,
+            view,
+        } => {
             let store = SessionStore::open(&cfg.data_dir)?;
             let session = store
                 .get_session(session_id)?
                 .with_context(|| format!("session {session_id} not found"))?;
-            println!("{}", render_session(&session, format.into())?);
+            let fmt: TranscriptFormat = format.into();
+            let rendered = if fmt == TranscriptFormat::Markdown {
+                render_markdown_with_view(&session, view.into())
+            } else {
+                render_session(&session, fmt)?
+            };
+            println!("{rendered}");
         }
         Commands::Search { query, limit } => {
             let store = SessionStore::open(&cfg.data_dir)?;
@@ -763,13 +803,13 @@ fn run_session_cleanup(
         }
     }
     let used_qwen = qwen_model.is_some();
-    let updated = store.cleanup_session_with_progress(
+    let updated = store.cleanup_session_with_context_and_progress(
         session_id,
-        |utt| {
+        |utt, prev, next| {
             let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
             let base = basic_heuristic_cleanup(source, &kws);
             let cleaned = if let Some(q) = qwen_model.as_mut() {
-                let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
+                let (sys, usr) = build_qwen_cleanup_prompt_with_context(prev, &base, next, &kws);
                 match q.complete(&sys, &usr, 128) {
                     Ok(cand) => sanitize_cleanup_edit(&base, &cand),
                     Err(_) => base,
