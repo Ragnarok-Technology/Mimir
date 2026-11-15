@@ -70,6 +70,7 @@ final class MimirController: ObservableObject {
     private var liveStdoutBuffer = ""
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
+    private var terminationObserver: NSObjectProtocol?
     private var autoDetectTask: Task<Void, Never>?
     private var wasAudioActiveBeforeStop = false
 
@@ -92,6 +93,15 @@ final class MimirController: ObservableObject {
     init() {
         refreshSessions()
         installHotkeys()
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.shutdownSync()
+            }
+        }
     }
 
     private func installHotkeys() {
@@ -235,19 +245,64 @@ final class MimirController: ObservableObject {
     }
 
     func stopRecording() {
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        let tap = systemTap
+        systemTap = nil
         Task {
-            await systemTap?.stop()
-            systemTap = nil
-            try? stdinPipe?.fileHandleForWriting.close()
-            stdinPipe = nil
+            await tap?.stop()
         }
         if let proc = recordProcess, proc.isRunning {
-            kill(proc.processIdentifier, SIGINT)
+            let pid = proc.processIdentifier
+            kill(pid, SIGINT)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0) {
+                if proc.isRunning {
+                    kill(pid, SIGTERM)
+                }
+            }
         }
         micActivity = 0
         sysActivity = 0
         wasAudioActiveBeforeStop = true
         statusMessage = "Finalizing transcript…"
+    }
+
+    /// Synchronously stops capture and waits briefly for `mimir-cli` to release
+    /// the microphone and flush SQLite before the app terminates.
+    func shutdownSync() {
+        autoDetectTask?.cancel()
+        autoDetectTask = nil
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        let tap = systemTap
+        systemTap = nil
+        if let tap {
+            Task {
+                await tap.stop()
+            }
+        }
+        if let proc = recordProcess, proc.isRunning {
+            let pid = proc.processIdentifier
+            kill(pid, SIGINT)
+            let deadline = Date().addingTimeInterval(1.5)
+            while proc.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if proc.isRunning {
+                proc.terminate()
+                let termDeadline = Date().addingTimeInterval(0.5)
+                while proc.isRunning && Date() < termDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            if proc.isRunning {
+                kill(pid, SIGKILL)
+            }
+        }
+        recordProcess = nil
+        isRecording = false
+        micActivity = 0
+        sysActivity = 0
     }
 
     private func updateAutoDetectMonitor() {

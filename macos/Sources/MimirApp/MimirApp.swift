@@ -26,6 +26,7 @@ struct MimirMacApp: App {
             }
             Divider()
             Button("Quit Mimir") {
+                controller.shutdownSync()
                 NSApplication.shared.terminate(nil)
             }
         } label: {

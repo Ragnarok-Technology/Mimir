@@ -486,6 +486,10 @@ impl MimirDesktopApp {
 }
 
 impl eframe::App for MimirDesktopApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_recording();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::M)) {
