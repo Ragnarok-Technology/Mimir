@@ -14,11 +14,21 @@ struct MimirSearchHit: Identifiable, Decodable {
     var id: String { utterance_id }
 }
 
+struct MimirModelStatus: Identifiable, Decodable {
+    let id: String
+    let name: String
+    let installed: Bool
+    let size_bytes: UInt64
+    let expected_size_label: String
+    let path: String
+}
+
 @MainActor
 final class MimirController: ObservableObject {
     @Published var isRecording = false
     @Published var diarizeMic = false
     @Published var saveWav = false
+    @Published var enableCleanup = false
     @Published var autoDetectCalls = false {
         didSet { updateAutoDetectMonitor() }
     }
@@ -41,6 +51,9 @@ final class MimirController: ObservableObject {
     @Published var connectReport = ""
     @Published var updateMessage = ""
     @Published var updateDownloadURL: URL?
+    @Published var modelStatuses: [MimirModelStatus] = []
+    @Published var activeModelTaskId: String?
+    @Published var isCleaningSession = false
 
     private var recordProcess: Process?
     private var stdinPipe: Pipe?
@@ -118,6 +131,9 @@ final class MimirController: ObservableObject {
         }
         if saveWav {
             args.append("--save-wav")
+        }
+        if enableCleanup {
+            args.append("--cleanup")
         }
         for kw in keywordsText.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !kw.isEmpty {
             args += ["--keyword", kw]
@@ -436,11 +452,71 @@ final class MimirController: ObservableObject {
         }
     }
 
-    func fetchModel() {
-        statusMessage = "Fetching whistle.cact (16.9 MB)…"
+    func refreshModelStatuses() {
         Task {
-            let output = await runCli(["fetch"])
-            self.statusMessage = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let output = await runCli(["models", "status", "--json"])
+            if let data = output.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([MimirModelStatus].self, from: data)
+            {
+                self.modelStatuses = decoded
+            }
+        }
+    }
+
+    func fetchModel(_ id: String = "whistle") {
+        activeModelTaskId = id
+        let flag: [String]
+        switch id {
+        case "qwen":
+            statusMessage = "Downloading Qwen 2.5 0.5B Instruct (475 MB)…"
+            flag = ["fetch", "--qwen"]
+        case "silero_vad", "speaker_embed", "onnx":
+            statusMessage = "Downloading ONNX VAD & Speaker Embedding models…"
+            flag = ["fetch", "--onnx"]
+        case "all":
+            statusMessage = "Downloading all local Mimir models…"
+            flag = ["fetch", "--all"]
+        default:
+            statusMessage = "Fetching whistle.cact (16.9 MB)…"
+            flag = ["fetch"]
+        }
+        Task {
+            let output = await runCli(flag)
+            self.activeModelTaskId = nil
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed.components(separatedBy: "\n").last ?? trimmed
+            }
+            self.refreshModelStatuses()
+        }
+    }
+
+    func deleteModel(_ id: String) {
+        activeModelTaskId = id
+        statusMessage = "Removing \(id)…"
+        Task {
+            let output = await runCli(["models", "delete", id])
+            self.activeModelTaskId = nil
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.refreshModelStatuses()
+        }
+    }
+
+    func cleanupSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        isCleaningSession = true
+        statusMessage = "Running local Qwen transcript cleanup…"
+        Task {
+            let output = await runCli(["cleanup", sid])
+            self.isCleaningSession = false
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.selectSession(sid)
         }
     }
 

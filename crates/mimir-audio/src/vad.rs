@@ -1,6 +1,7 @@
 //! Per-channel Voice Activity Detection (VAD) and <= 28s chunking for Whistle.
 
 use crate::bleed::frame_rms;
+use crate::silero::SileroVadOnnx;
 use mimir_core::{AudioChunk, ChannelId, WHISTLE_SAMPLE_RATE};
 use std::collections::VecDeque;
 
@@ -15,6 +16,7 @@ const OVERLAP_SAMPLES: usize = WHISTLE_SAMPLE_RATE as usize / 2; // 0.5s overlap
 pub struct VadChunker {
     channel: ChannelId,
     energy_threshold: f32,
+    silero: Option<SileroVadOnnx>,
     sample_cursor: u64,
     pre_roll: VecDeque<f32>,
     active_buf: Vec<f32>,
@@ -30,6 +32,7 @@ impl VadChunker {
         Self {
             channel,
             energy_threshold,
+            silero: None,
             sample_cursor: 0,
             pre_roll: VecDeque::with_capacity(PRE_ROLL_FRAMES * FRAME_SAMPLES),
             active_buf: Vec::new(),
@@ -41,6 +44,17 @@ impl VadChunker {
         }
     }
 
+    /// Creates a VAD chunker backed by Silero VAD v5 ONNX, falling back to RMS threshold on error.
+    pub fn with_silero(
+        channel: ChannelId,
+        energy_threshold: f32,
+        silero: SileroVadOnnx,
+    ) -> Self {
+        let mut chunker = Self::new(channel, energy_threshold);
+        chunker.silero = Some(silero);
+        chunker
+    }
+
     /// Feeds 16 kHz mono samples and returns any completed speech chunks.
     pub fn push(&mut self, samples: &[f32]) -> Vec<AudioChunk> {
         let mut emitted = Vec::new();
@@ -48,8 +62,11 @@ impl VadChunker {
 
         while self.pending_frame.len() >= FRAME_SAMPLES {
             let frame: Vec<f32> = self.pending_frame.drain(..FRAME_SAMPLES).collect();
-            let rms = frame_rms(&frame);
-            let is_voiced = rms >= self.energy_threshold;
+            let rms_voiced = frame_rms(&frame) >= self.energy_threshold;
+            let is_voiced = match self.silero.as_mut() {
+                Some(vad) => vad.is_speech(&frame).unwrap_or(rms_voiced),
+                None => rms_voiced,
+            };
 
             if !self.in_speech {
                 if is_voiced {

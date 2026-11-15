@@ -7,13 +7,22 @@ use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::http::{ensure_bearer_token, serve_http};
 use mimir_bridge::mcp;
 use mimir_core::{MimirConfig, Session, TranscriptFormat};
-use mimir_diarize::DiarizerConfig;
+use mimir_diarize::{DiarizerConfig, OnnxSpeakerEmbedder};
+use mimir_store::cleanup::{
+    basic_heuristic_cleanup, build_qwen_cleanup_prompt, sanitize_cleanup_edit,
+};
 use mimir_store::{SessionStore, export::render_session};
-use mimir_whistle::artifact::{fetch_whistle_weights, resolve_lib_path, resolve_weights_path};
+use mimir_whistle::artifact::{
+    delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model,
+    fetch_silero_vad, fetch_speaker_embed, fetch_whistle_weights, model_statuses,
+    resolve_lib_path, resolve_qwen_paths, resolve_silero_vad_path, resolve_speaker_embed_path,
+    resolve_weights_path,
+};
+use mimir_whistle::qwen::QwenCleanupModel;
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
 use std::io::{self, BufReader};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -55,8 +64,29 @@ enum Commands {
     Status,
     /// List available OS audio input and output devices.
     Devices,
-    /// Download and SHA-256 verify `whistle.cact` (16.9 MB) into local cache.
-    Fetch,
+    /// Download and SHA-256 verify local models (`whistle.cact` by default, or `--qwen`, `--onnx`, `--all`).
+    Fetch {
+        /// Download Qwen 2.5 0.5B Instruct (Q4_K_M GGUF + tokenizer) for transcript cleanup.
+        #[arg(long)]
+        qwen: bool,
+        /// Download ONNX Silero VAD v5 and WeSpeaker CAM++ speaker embedding models.
+        #[arg(long)]
+        onnx: bool,
+        /// Download all local models (Whistle, Qwen cleanup, Silero VAD, Speaker Embeddings).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect or delete locally cached Mimir AI models.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+    /// Run local transcript cleanup (Qwen 2.5 0.5B Instruct + heuristics) on a past session.
+    Cleanup {
+        session_id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
     /// Start live dual-channel meeting/conversation capture and transcription.
     Start {
         #[arg(long)]
@@ -82,6 +112,9 @@ enum Commands {
         /// Retain local 16 kHz mono .wav audio files for this session (`FR-4.4`).
         #[arg(long)]
         save_wav: bool,
+        /// Run post-processing transcript cleanup after recording stops (Qwen 2.5 0.5B if installed + heuristics).
+        #[arg(long)]
+        cleanup: bool,
     },
     /// Stop an active background Mimir capture session.
     Stop,
@@ -168,6 +201,17 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ModelsAction {
+    /// Show installation status, sizes, and paths of all local models.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a cached model (`whistle`, `qwen`, `silero_vad`, `speaker_embed`, or `onnx`).
+    Delete { id: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -208,11 +252,94 @@ async fn main() -> Result<()> {
                 println!("{dev}");
             }
         }
-        Commands::Fetch => {
-            let dest = resolve_weights_path(&cfg);
-            println!("Fetching whistle.cact -> {}", dest.display());
-            fetch_whistle_weights(&dest)?;
-            println!("Verified SHA-256 OK: {}", dest.display());
+        Commands::Fetch { qwen, onnx, all } => {
+            let do_whistle = all || (!qwen && !onnx);
+            if do_whistle {
+                let dest = resolve_weights_path(&cfg);
+                println!("Fetching whistle.cact -> {}", dest.display());
+                fetch_whistle_weights(&dest)?;
+                println!("Verified SHA-256 OK: {}", dest.display());
+            }
+            if all || qwen {
+                println!("Fetching Qwen 2.5 0.5B Instruct (Q4_K_M GGUF + tokenizer)...");
+                let (weights, tokenizer) = fetch_qwen_model(&cfg)?;
+                println!("Verified SHA-256 OK: {}", weights.display());
+                println!("Verified SHA-256 OK: {}", tokenizer.display());
+            }
+            if all || onnx {
+                println!("Fetching Silero VAD v5 ONNX...");
+                let silero = fetch_silero_vad(&cfg)?;
+                println!("Verified SHA-256 OK: {}", silero.display());
+                println!("Fetching WeSpeaker CAM++ speaker embedding ONNX...");
+                let spk = fetch_speaker_embed(&cfg)?;
+                println!("Verified SHA-256 OK: {}", spk.display());
+            }
+        }
+        Commands::Models { action } => match action {
+            ModelsAction::Status { json } => {
+                let statuses = model_statuses(&cfg);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&statuses)?);
+                } else {
+                    for s in statuses {
+                        let state = if s.installed {
+                            format!("installed ({:.1} MB)", s.size_bytes as f64 / (1024.0 * 1024.0))
+                        } else {
+                            format!("not installed ({})", s.expected_size_label)
+                        };
+                        println!("{:<15} {:<45} {}", s.id, s.name, state);
+                    }
+                }
+            }
+            ModelsAction::Delete { id } => {
+                match id.as_str() {
+                    "whistle" => {
+                        let p = resolve_weights_path(&cfg);
+                        if p.exists() {
+                            std::fs::remove_file(&p)?;
+                        }
+                        println!("Deleted whistle.cact");
+                    }
+                    "qwen" => {
+                        delete_qwen_model(&cfg)?;
+                        println!("Deleted Qwen 2.5 0.5B Instruct");
+                    }
+                    "silero_vad" => {
+                        delete_silero_vad(&cfg)?;
+                        println!("Deleted silero_vad.onnx");
+                    }
+                    "speaker_embed" => {
+                        delete_speaker_embed(&cfg)?;
+                        println!("Deleted speaker_embed.onnx");
+                    }
+                    "onnx" => {
+                        delete_silero_vad(&cfg)?;
+                        delete_speaker_embed(&cfg)?;
+                        println!("Deleted ONNX VAD and speaker embedding models");
+                    }
+                    other => anyhow::bail!("unknown model id: {other}"),
+                }
+            }
+        },
+        Commands::Cleanup { session_id, json } => {
+            let (updated, used_qwen) = run_session_cleanup(&cfg, session_id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "session_id": session_id,
+                        "updated": updated,
+                        "used_qwen": used_qwen,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Cleaned session {} ({} utterance(s) updated, engine: {}).",
+                    session_id,
+                    updated,
+                    if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
+                );
+            }
         }
         Commands::Start {
             title,
@@ -224,6 +351,7 @@ async fn main() -> Result<()> {
             diarize_mic,
             system_pcm_stdin,
             save_wav,
+            cleanup,
         } => {
             let lib_path = resolve_lib_path(&cfg);
             let weights_path = resolve_weights_path(&cfg);
@@ -309,17 +437,31 @@ async fn main() -> Result<()> {
                 let _ = stop_tx.send(());
             });
 
+            let silero_path = resolve_silero_vad_path(&cfg);
+            let speaker_path = resolve_speaker_embed_path(&cfg);
+            let enable_cleanup = cleanup || cfg.cleanup_enabled;
+            let speaker_embedder = if speaker_path.is_file() {
+                OnnxSpeakerEmbedder::load(&speaker_path).ok().map(Arc::new)
+            } else {
+                None
+            };
+            let extras = pipeline::PipelineExtras {
+                silero_vad_path: silero_path.is_file().then_some(silero_path),
+                speaker_embedder,
+            };
+
             let session_id = session.id;
+            let host_label = cfg.host_label.clone();
             std::thread::scope(|s| {
                 let handle = s.spawn(move || {
-                    pipeline::run_pipeline_with_wav(
+                    pipeline::run_pipeline_with_extras(
                         rx,
                         &engine,
                         &store,
                         &mut session,
                         &opts,
                         DiarizerConfig {
-                            host_label: cfg.host_label.clone(),
+                            host_label,
                             diarize_mic,
                             ..Default::default()
                         },
@@ -327,6 +469,7 @@ async fn main() -> Result<()> {
                         drop_target.as_deref(),
                         wav_target.as_deref(),
                         tail,
+                        extras,
                     )
                 });
                 let _ = stop_rx.recv();
@@ -335,6 +478,15 @@ async fn main() -> Result<()> {
             })?;
 
             let _ = std::fs::remove_file(&pid_path);
+            if enable_cleanup {
+                let (updated, used_qwen) = run_session_cleanup(&cfg, session_id)?;
+                eprintln!(
+                    "Post-processed session {} ({} utterance(s) updated, engine: {}).",
+                    session_id,
+                    updated,
+                    if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
+                );
+            }
             eprintln!("Session {} saved.", session_id);
         }
         Commands::Stop => {
@@ -580,4 +732,39 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     }
     let _ = child.wait()?;
     Ok(())
+}
+
+fn run_session_cleanup(cfg: &MimirConfig, session_id: Uuid) -> Result<(usize, bool)> {
+    let store = SessionStore::open(&cfg.data_dir)?;
+    let Some(session) = store.get_session(session_id)? else {
+        anyhow::bail!("session {session_id} not found");
+    };
+    let (qwen_weights, qwen_tok) = resolve_qwen_paths(cfg);
+    let mut qwen_model = if qwen_weights.is_file() && qwen_tok.is_file() {
+        Some(QwenCleanupModel::load(&qwen_weights, &qwen_tok)?)
+    } else {
+        None
+    };
+    let mut kws = cfg.keywords.clone();
+    for k in &session.keywords_used {
+        if !kws.contains(k) {
+            kws.push(k.clone());
+        }
+    }
+    let used_qwen = qwen_model.is_some();
+    let updated = store.cleanup_session(session_id, |utt| {
+        let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
+        let base = basic_heuristic_cleanup(source, &kws);
+        let cleaned = if let Some(q) = qwen_model.as_mut() {
+            let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
+            match q.complete(&sys, &usr, 128) {
+                Ok(cand) => sanitize_cleanup_edit(&base, &cand),
+                Err(_) => base,
+            }
+        } else {
+            base
+        };
+        Ok(Some(cleaned))
+    })?;
+    Ok((updated, used_qwen))
 }

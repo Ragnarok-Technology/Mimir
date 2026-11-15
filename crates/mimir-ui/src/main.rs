@@ -7,8 +7,16 @@ use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
 use mimir_core::{AudioRetention, ChannelId, MimirConfig, Session, TranscriptFormat, Utterance};
 use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
+use mimir_store::cleanup::{
+    basic_heuristic_cleanup, build_qwen_cleanup_prompt, sanitize_cleanup_edit,
+};
 use mimir_store::{SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir, export::render_session};
-use mimir_whistle::artifact::{fetch_whistle_weights, resolve_lib_path, resolve_weights_path};
+use mimir_whistle::artifact::{
+    delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model,
+    fetch_silero_vad, fetch_speaker_embed, fetch_whistle_weights, model_statuses,
+    resolve_lib_path, resolve_qwen_paths, resolve_weights_path,
+};
+use mimir_whistle::qwen::QwenCleanupModel;
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -323,6 +331,7 @@ impl MimirDesktopApp {
                                         start_ms: chunk.start_ms,
                                         end_ms,
                                         text: trimmed.to_string(),
+                                        raw_text: None,
                                         language: res.language.clone(),
                                         avg_confidence: 1.0,
                                         words,
@@ -749,6 +758,54 @@ impl eframe::App for MimirDesktopApp {
                         {
                             self.confirm_delete_id = Some(sel_id);
                         }
+                        if ui.button("Run Cleanup").clicked() {
+                            let data_dir = self.cfg.data_dir.clone();
+                            let (qwen_w, qwen_t) = resolve_qwen_paths(&self.cfg);
+                            let mut kws = self.cfg.keywords.clone();
+                            let tx = self.event_tx.clone();
+                            self.status_line = "Running local transcript cleanup…".into();
+                            std::thread::spawn(move || {
+                                let res: anyhow::Result<String> = (|| {
+                                    let store = SessionStore::open(&data_dir)?;
+                                    if let Some(sess) = store.get_session(sel_id)? {
+                                        for k in &sess.keywords_used {
+                                            if !kws.contains(k) {
+                                                kws.push(k.clone());
+                                            }
+                                        }
+                                    }
+                                    let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                                        Some(QwenCleanupModel::load(&qwen_w, &qwen_t)?)
+                                    } else {
+                                        None
+                                    };
+                                    let used_qwen = qwen.is_some();
+                                    let updated = store.cleanup_session(sel_id, |utt| {
+                                        let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
+                                        let base = basic_heuristic_cleanup(src, &kws);
+                                        let cleaned = if let Some(q) = qwen.as_mut() {
+                                            let (sys, usr) = build_qwen_cleanup_prompt(&base, &kws);
+                                            match q.complete(&sys, &usr, 128) {
+                                                Ok(cand) => sanitize_cleanup_edit(&base, &cand),
+                                                Err(_) => base,
+                                            }
+                                        } else {
+                                            base
+                                        };
+                                        Ok(Some(cleaned))
+                                    })?;
+                                    Ok(format!(
+                                        "Cleaned {updated} utterance(s) via {}",
+                                        if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
+                                    ))
+                                })();
+                                let msg = match res {
+                                    Ok(s) => s,
+                                    Err(e) => format!("Cleanup error: {e}"),
+                                };
+                                let _ = tx.send(UiEvent::Status(msg));
+                            });
+                        }
                     });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -820,21 +877,8 @@ impl eframe::App for MimirDesktopApp {
                     .corner_radius(8)
                     .inner_margin(egui::Margin::same(14))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("WHISTLE MODEL & UPDATES").monospace().size(11.0).color(text_muted));
-                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Download / Verify whistle.cact (16.9 MB)").clicked() {
-                                let dest = resolve_weights_path(&self.cfg);
-                                let tx = self.event_tx.clone();
-                                self.status_line = "Fetching whistle.cact…".into();
-                                std::thread::spawn(move || {
-                                    let msg = match fetch_whistle_weights(&dest) {
-                                        Ok(p) => format!("Verified whistle.cact at {}", p.display()),
-                                        Err(e) => format!("Fetch error: {e}"),
-                                    };
-                                    let _ = tx.send(UiEvent::Status(msg));
-                                });
-                            }
+                            ui.label(egui::RichText::new("LOCAL AI MODELS & UPDATES").monospace().size(11.0).color(text_muted));
                             if ui.button("Check for Updates…").clicked() {
                                 let tx = self.event_tx.clone();
                                 self.update_line = "Checking GitHub Releases…".into();
@@ -844,6 +888,59 @@ impl eframe::App for MimirDesktopApp {
                                 });
                             }
                         });
+                        ui.add_space(6.0);
+                        for m in model_statuses(&self.cfg) {
+                            ui.horizontal(|ui| {
+                                let status_str = if m.installed {
+                                    format!("Installed ({:.1} MB)", m.size_bytes as f64 / (1024.0 * 1024.0))
+                                } else {
+                                    format!("Not installed ({})", m.expected_size_label)
+                                };
+                                ui.label(format!("{} — {}", m.name, status_str));
+                                let btn_lbl = if m.installed { "Verify" } else { "Download" };
+                                if ui.button(btn_lbl).clicked() {
+                                    let cfg_clone = self.cfg.clone();
+                                    let tx = self.event_tx.clone();
+                                    let id = m.id.clone();
+                                    self.status_line = format!("Downloading {}…", m.name);
+                                    std::thread::spawn(move || {
+                                        let msg = match id.as_str() {
+                                            "whistle" => match fetch_whistle_weights(&resolve_weights_path(&cfg_clone)) {
+                                                Ok(p) => format!("Verified whistle.cact at {}", p.display()),
+                                                Err(e) => format!("Fetch error: {e}"),
+                                            },
+                                            "qwen" => match fetch_qwen_model(&cfg_clone) {
+                                                Ok((w, _)) => format!("Verified Qwen 2.5 0.5B at {}", w.display()),
+                                                Err(e) => format!("Fetch error: {e}"),
+                                            },
+                                            "silero_vad" => match fetch_silero_vad(&cfg_clone) {
+                                                Ok(p) => format!("Verified silero_vad.onnx at {}", p.display()),
+                                                Err(e) => format!("Fetch error: {e}"),
+                                            },
+                                            "speaker_embed" => match fetch_speaker_embed(&cfg_clone) {
+                                                Ok(p) => format!("Verified speaker_embed.onnx at {}", p.display()),
+                                                Err(e) => format!("Fetch error: {e}"),
+                                            },
+                                            _ => "Unknown model".into(),
+                                        };
+                                        let _ = tx.send(UiEvent::Status(msg));
+                                    });
+                                }
+                                if m.installed && ui.button("Delete").clicked() {
+                                    let res = match m.id.as_str() {
+                                        "whistle" => std::fs::remove_file(resolve_weights_path(&self.cfg)).map_err(Into::into),
+                                        "qwen" => delete_qwen_model(&self.cfg),
+                                        "silero_vad" => delete_silero_vad(&self.cfg),
+                                        "speaker_embed" => delete_speaker_embed(&self.cfg),
+                                        _ => Ok(()),
+                                    };
+                                    self.status_line = match res {
+                                        Ok(()) => format!("Deleted {}", m.name),
+                                        Err(e) => format!("Delete error: {e}"),
+                                    };
+                                }
+                            });
+                        }
                         if !self.update_line.is_empty() {
                             ui.add_space(6.0);
                             ui.label(&self.update_line);

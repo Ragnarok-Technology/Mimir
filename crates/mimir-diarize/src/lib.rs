@@ -1,8 +1,12 @@
 //! Speaker attribution, embedding clustering, ghost-bleed deduplication, and timeline merging.
 
+pub mod onnx;
+
 use mimir_core::{ChannelId, SpeakerInfo, Utterance};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+pub use onnx::{OnnxSpeakerEmbedder, SpeakerEmbedder};
 
 /// Configuration for speaker diarization and bleed deduplication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +368,7 @@ mod tests {
             start_ms,
             end_ms,
             text: text.into(),
+            raw_text: None,
             language: "en".into(),
             avg_confidence: 0.95,
             words: Vec::new(),

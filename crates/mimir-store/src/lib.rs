@@ -1,5 +1,6 @@
 //! Local session storage (SQLite FTS5 + crash-safe JSONL WAL) and drop-folder sync.
 
+pub mod cleanup;
 pub mod export;
 
 use chrono::{DateTime, Utc};
@@ -97,6 +98,7 @@ impl SessionStore {
                 start_ms INTEGER NOT NULL,
                 end_ms INTEGER NOT NULL,
                 text TEXT NOT NULL,
+                raw_text TEXT,
                 language TEXT NOT NULL,
                 avg_confidence REAL NOT NULL,
                 words_json TEXT NOT NULL DEFAULT '[]',
@@ -121,9 +123,13 @@ impl SessionStore {
         )
         .map_err(|e| MimirError::Storage(format!("failed to initialize schema: {e}")))?;
 
-        // Idempotent migration for pre-existing databases without `archived`.
+        // Idempotent migrations for pre-existing databases.
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE utterances ADD COLUMN raw_text TEXT",
             [],
         );
 
@@ -206,8 +212,8 @@ impl SessionStore {
         self.conn
             .execute(
                 "INSERT INTO utterances
-                 (id, session_id, speaker_id, channel, start_ms, end_ms, text, language, avg_confidence, words_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, session_id, speaker_id, channel, start_ms, end_ms, text, raw_text, language, avg_confidence, words_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     utterance.id.to_string(),
                     session_id.to_string(),
@@ -216,6 +222,7 @@ impl SessionStore {
                     utterance.start_ms as i64,
                     utterance.end_ms as i64,
                     utterance.text,
+                    utterance.raw_text,
                     utterance.language,
                     utterance.avg_confidence,
                     words_json,
@@ -357,6 +364,52 @@ impl SessionStore {
         Ok(rows > 0)
     }
 
+    /// Updates an utterance's cleaned text (preserving `raw_text`) and re-indexes FTS5.
+    pub fn update_utterance_text(
+        &self,
+        utterance_id: Uuid,
+        new_text: &str,
+        raw_text: Option<&str>,
+    ) -> Result<()> {
+        let uid = utterance_id.to_string();
+        self.conn
+            .execute(
+                "UPDATE utterances SET text = ?1, raw_text = COALESCE(raw_text, ?2) WHERE id = ?3",
+                params![new_text, raw_text, &uid],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        self.conn
+            .execute(
+                "UPDATE utterances_fts SET text = ?1 WHERE utterance_id = ?2",
+                params![new_text, &uid],
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Runs a cleanup callback across all utterances in a session and persists changed text.
+    /// Returns the number of utterances updated.
+    pub fn cleanup_session<F>(&self, session_id: Uuid, mut cleaner: F) -> Result<usize>
+    where
+        F: FnMut(&Utterance) -> Result<Option<String>>,
+    {
+        let Some(session) = self.get_session(session_id)? else {
+            return Err(MimirError::Storage(format!("session {session_id} not found")));
+        };
+        let mut updated = 0usize;
+        for utt in &session.utterances {
+            let source = utt.raw_text.as_deref().unwrap_or(&utt.text);
+            if let Some(cleaned) = cleaner(utt)? {
+                let cleaned = cleaned.trim();
+                if !cleaned.is_empty() && cleaned != utt.text {
+                    self.update_utterance_text(utt.id, cleaned, Some(source))?;
+                    updated += 1;
+                }
+            }
+        }
+        Ok(updated)
+    }
+
     /// Permanently deletes a session, its utterances, FTS index entries, and JSONL WAL file.
     pub fn delete_session(&self, session_id: Uuid) -> Result<bool> {
         let id_str = session_id.to_string();
@@ -475,7 +528,7 @@ impl SessionStore {
         let mut utt_stmt = self
             .conn
             .prepare(
-                "SELECT id, speaker_id, channel, start_ms, end_ms, text, language, avg_confidence, words_json
+                "SELECT id, speaker_id, channel, start_ms, end_ms, text, raw_text, language, avg_confidence, words_json
                  FROM utterances WHERE session_id = ?1 ORDER BY start_ms ASC, end_ms ASC",
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
@@ -488,15 +541,16 @@ impl SessionStore {
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, f32>(7)?,
-                    r.get::<_, String>(8)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, f32>(8)?,
+                    r.get::<_, String>(9)?,
                 ))
             })
             .map_err(|e| MimirError::Storage(e.to_string()))?;
 
         for ur in utt_rows {
-            let (uid, speaker_id, ch_str, start_ms, end_ms, text, language, avg_confidence, words_json) =
+            let (uid, speaker_id, ch_str, start_ms, end_ms, text, raw_text, language, avg_confidence, words_json) =
                 ur.map_err(|e| MimirError::Storage(e.to_string()))?;
             let words: Vec<WordToken> = serde_json::from_str(&words_json).unwrap_or_default();
             utterances.push(Utterance {
@@ -510,6 +564,7 @@ impl SessionStore {
                 start_ms: start_ms.max(0) as u64,
                 end_ms: end_ms.max(0) as u64,
                 text,
+                raw_text,
                 language,
                 avg_confidence,
                 words,
@@ -633,6 +688,7 @@ mod tests {
             start_ms,
             end_ms: start_ms + 1200,
             text: text.into(),
+            raw_text: None,
             language: "en".into(),
             avg_confidence: 0.94,
             words: vec![],

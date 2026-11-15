@@ -326,6 +326,8 @@ private struct LeftControlRail: View {
                     .disabled(controller.isRecording)
                 Toggle("Save Local WAVs", isOn: $controller.saveWav)
                     .disabled(controller.isRecording)
+                Toggle("Post-Process Cleanup", isOn: $controller.enableCleanup)
+                    .disabled(controller.isRecording)
                 Toggle("Auto-Detect Calls", isOn: $controller.autoDetectCalls)
             }
             .font(.system(size: 12))
@@ -611,6 +613,18 @@ struct SessionsTab: View {
                     Text("This permanently deletes the transcript and its local search index.")
                 }
 
+                Button(controller.isCleaningSession ? "Cleaning…" : "Run Cleanup") {
+                    controller.cleanupSelectedSession()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(MimirTheme.cyan)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(MimirTheme.elevatedBg)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.cyan.opacity(0.5), lineWidth: 1))
+                .disabled(selectedSummary == nil || controller.isCleaningSession)
+
                 Button("Copy Markdown") {
                     controller.copySelectedTranscript()
                 }
@@ -712,18 +726,62 @@ struct AssistantsTab: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("WHISTLE MODEL & UPDATES")
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(MimirTheme.textMuted)
                 HStack {
-                    Button("Download / Verify whistle.cact (16.9 MB)") {
-                        controller.fetchModel()
-                    }
+                    Text("LOCAL AI MODELS & UPDATES")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(MimirTheme.textMuted)
                     Spacer()
+                    Button("Download All") {
+                        controller.fetchModel("all")
+                    }
+                    .disabled(controller.activeModelTaskId != nil)
+                    Button("Refresh") {
+                        controller.refreshModelStatuses()
+                    }
                     Button("Check for App Updates…") {
                         controller.checkForUpdates()
                     }
                 }
+
+                ForEach(controller.modelStatuses) { model in
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(model.installed ? Color.green : MimirTheme.textMuted.opacity(0.4))
+                            .frame(width: 8, height: 8)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.name)
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(MimirTheme.textPrimary)
+                            Text(
+                                model.installed
+                                    ? String(format: "Installed (%.1f MB)", Double(model.size_bytes) / (1024.0 * 1024.0))
+                                    : "Not installed (\(model.expected_size_label))"
+                            )
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                        }
+                        Spacer()
+                        if controller.activeModelTaskId == model.id || controller.activeModelTaskId == "all" {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Button(model.installed ? "Verify" : "Download") {
+                            controller.fetchModel(model.id)
+                        }
+                        .disabled(controller.activeModelTaskId != nil)
+                        if model.installed {
+                            Button("Delete") {
+                                controller.deleteModel(model.id)
+                            }
+                            .foregroundStyle(Color.red.opacity(0.9))
+                            .disabled(controller.activeModelTaskId != nil)
+                        }
+                    }
+                    .padding(8)
+                    .background(MimirTheme.voidBg)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+                }
+
                 if !controller.updateMessage.isEmpty {
                     HStack {
                         Text(controller.updateMessage)
@@ -735,6 +793,9 @@ struct AssistantsTab: View {
                         }
                     }
                 }
+            }
+            .onAppear {
+                controller.refreshModelStatuses()
             }
             .padding(14)
             .background(MimirTheme.cardBg)
