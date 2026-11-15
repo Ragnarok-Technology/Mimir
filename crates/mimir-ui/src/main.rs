@@ -745,9 +745,10 @@ impl eframe::App for MimirDesktopApp {
                         .iter()
                         .find(|s| s.id == sel_id)
                         .is_some_and(|s| s.archived);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.selected_title_edit)
+                                .desired_width(200.0)
                                 .hint_text("Session title…"),
                         );
                         if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -947,7 +948,7 @@ impl eframe::App for MimirDesktopApp {
                         });
                         ui.add_space(6.0);
                         for m in model_statuses(&self.cfg) {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let status_str = if m.installed {
                                     format!("Installed ({:.1} MB)", m.size_bytes as f64 / (1024.0 * 1024.0))
                                 } else {
@@ -1132,7 +1133,8 @@ fn main() -> eframe::Result<()> {
     ))
     .ok();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([860.0, 560.0])
+        .with_inner_size([1080.0, 700.0])
+        .with_min_inner_size([720.0, 500.0])
         .with_title("Mimir");
     if let Some(ic) = icon {
         viewport = viewport.with_icon(std::sync::Arc::new(ic));
