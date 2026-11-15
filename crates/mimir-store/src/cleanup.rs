@@ -22,11 +22,14 @@ pub fn sanitize_cleanup_edit(raw: &str, candidate: &str) -> String {
     }
 
     let lower = cleaned.to_lowercase();
-    const CHATTER_PREFIXES: [&str; 6] = [
+    const CHATTER_PREFIXES: [&str; 9] = [
         "here is",
         "here's",
         "cleaned:",
         "corrected:",
+        "previous:",
+        "target:",
+        "next:",
         "i cannot",
         "as an ai",
     ];
@@ -42,6 +45,26 @@ pub fn sanitize_cleanup_edit(raw: &str, candidate: &str) -> String {
     if raw_words >= 4 {
         let ratio = new_words as f32 / raw_words as f32;
         if !(0.55..=1.6).contains(&ratio) {
+            return raw_trimmed.to_string();
+        }
+    }
+    // Reject edits that append/invent more than 2 extra words or drop too much of raw.
+    if new_words > raw_words + 2 {
+        return raw_trimmed.to_string();
+    }
+    let raw_tokens: std::collections::HashSet<String> = raw_trimmed
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let new_tokens: std::collections::HashSet<String> = cleaned
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if !raw_tokens.is_empty() {
+        let kept = raw_tokens.intersection(&new_tokens).count();
+        if kept * 2 < raw_tokens.len() {
             return raw_trimmed.to_string();
         }
     }
@@ -85,17 +108,6 @@ pub fn basic_heuristic_cleanup(raw: &str, keywords: &[String]) -> String {
 
 /// Builds the system and user prompt pair for Qwen 2.5 0.5B Instruct transcript cleanup.
 pub fn build_qwen_cleanup_prompt(raw: &str, keywords: &[String]) -> (String, String) {
-    build_qwen_cleanup_prompt_with_context(None, raw, None, keywords)
-}
-
-/// Builds a context-aware prompt using neighboring utterances so Qwen can resolve
-/// phonetic ASR mishearings without dropping words or changing meaning.
-pub fn build_qwen_cleanup_prompt_with_context(
-    prev: Option<&str>,
-    raw: &str,
-    next: Option<&str>,
-    keywords: &[String],
-) -> (String, String) {
     let kw_hint = if keywords.is_empty() {
         String::new()
     } else {
@@ -105,17 +117,20 @@ pub fn build_qwen_cleanup_prompt_with_context(
         )
     };
     let system = format!(
-        "You are a conservative speech-to-text transcript editor. Fix obvious phonetic ASR mishearings, split compound words, punctuation, and capitalization while keeping every spoken word (do not drop leading words like 'or', 'and', or 'so').{kw_hint} Use Previous/Next only as context and output ONLY the corrected Target line with no quotes or labels."
+        "You are a conservative speech-to-text transcript editor. Fix obvious phonetic ASR mishearings, split compound words, punctuation, and capitalization while keeping every spoken word (do not drop leading words like 'or', 'and', or 'so').{kw_hint} Output ONLY the corrected transcript line with no explanations or quotes."
     );
-    let mut user = String::new();
-    if let Some(p) = prev.map(str::trim).filter(|s| !s.is_empty()) {
-        user.push_str(&format!("Previous: {p}\n"));
-    }
-    user.push_str(&format!("Target: {}", raw.trim()));
-    if let Some(n) = next.map(str::trim).filter(|s| !s.is_empty()) {
-        user.push_str(&format!("\nNext: {n}"));
-    }
-    (system, user)
+    (system, raw.trim().to_string())
+}
+
+/// Kept for API compatibility; delegates to single-line `build_qwen_cleanup_prompt`
+/// so small 0.5B models never leak or duplicate neighboring utterances.
+pub fn build_qwen_cleanup_prompt_with_context(
+    _prev: Option<&str>,
+    raw: &str,
+    _next: Option<&str>,
+    keywords: &[String],
+) -> (String, String) {
+    build_qwen_cleanup_prompt(raw, keywords)
 }
 
 #[cfg(test)]
@@ -130,8 +145,23 @@ mod tests {
             raw
         );
         assert_eq!(
+            sanitize_cleanup_edit(raw, "Previous: something else"),
+            raw
+        );
+        assert_eq!(
             sanitize_cleanup_edit(raw, "one two three four five six seven eight nine ten eleven twelve"),
             raw
+        );
+        assert_eq!(
+            sanitize_cleanup_edit("It's overwhelmed.", "or New York."),
+            "It's overwhelmed."
+        );
+        assert_eq!(
+            sanitize_cleanup_edit(
+                "No other airplane lands.",
+                "No other airplane lands. We clear out the system."
+            ),
+            "No other airplane lands."
         );
         assert_eq!(
             sanitize_cleanup_edit(raw, "Yeah, let's deploy Mimir tomorrow morning."),
