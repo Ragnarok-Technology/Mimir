@@ -190,6 +190,7 @@ pub enum AudioRetention {
 
 /// Runtime configuration for Mimir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MimirConfig {
     pub data_dir: PathBuf,
     pub drop_dir: Option<PathBuf>,
@@ -200,17 +201,12 @@ pub struct MimirConfig {
     pub keywords: Vec<String>,
     pub audio_retention: AudioRetention,
     pub http_bind_addr: String,
-    #[serde(default)]
+    pub diarize_mic: bool,
     pub auto_detect_calls: bool,
-    #[serde(default)]
     pub encrypt_at_rest: bool,
-    #[serde(default)]
     pub cleanup_enabled: bool,
-    #[serde(default)]
     pub keyword_presets: Vec<KeywordPreset>,
-    #[serde(default)]
     pub drop_sync_enabled: bool,
-    #[serde(default)]
     pub calendar_ics_urls: Vec<String>,
 }
 
@@ -229,6 +225,7 @@ impl Default for MimirConfig {
             keywords: Vec::new(),
             audio_retention: AudioRetention::Ephemeral,
             http_bind_addr: "127.0.0.1:7331".to_string(),
+            diarize_mic: false,
             auto_detect_calls: false,
             encrypt_at_rest: false,
             cleanup_enabled: false,

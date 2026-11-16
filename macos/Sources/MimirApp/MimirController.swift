@@ -63,21 +63,36 @@ struct MimirCalendarEvent: Identifiable, Sendable {
 @MainActor
 final class MimirController: ObservableObject {
     @Published var isRecording = false
-    @Published var diarizeMic = false
-    @Published var saveWav = false
-    @Published var enableCleanup = false
-    @Published var autoDetectCalls = false {
-        didSet { updateAutoDetectMonitor() }
+    @Published var diarizeMic = false {
+        didSet { saveConfigIfReady() }
     }
-    @Published var captureSystemAudio = true
+    @Published var saveWav = false {
+        didSet { saveConfigIfReady() }
+    }
+    @Published var enableCleanup = false {
+        didSet { saveConfigIfReady() }
+    }
+    @Published var autoDetectCalls = false {
+        didSet {
+            updateAutoDetectMonitor()
+            saveConfigIfReady()
+        }
+    }
+    @Published var captureSystemAudio = true {
+        didSet { saveConfigIfReady() }
+    }
     @Published var micActivity: Double = 0
     @Published var sysActivity: Double = 0
     @Published var sessionTitle = ""
-    @Published var keywordsText = ""
+    @Published var keywordsText = "" {
+        didSet { saveConfigIfReady() }
+    }
     @Published var keywordPresets: [MimirKeywordPreset] = []
     @Published var selectedPresetName = ""
     @Published var presetNameInput = ""
-    @Published var dropSyncEnabled = false
+    @Published var dropSyncEnabled = false {
+        didSet { saveConfigIfReady() }
+    }
     @Published var liveLines: [String] = []
     @Published var sessions: [MimirSessionSummary] = []
     @Published var showArchived = false
@@ -821,6 +836,8 @@ final class MimirController: ObservableObject {
         }
     }
 
+    private var isLoadingConfig = false
+
     private var configFileURL: URL? {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -828,16 +845,43 @@ final class MimirController: ObservableObject {
             .appendingPathComponent("mimir/config.json")
     }
 
+    private func saveConfigIfReady() {
+        guard !isLoadingConfig else { return }
+        saveConfigFlags()
+    }
+
     func loadConfigFlags() {
+        isLoadingConfig = true
+        defer { isLoadingConfig = false }
+
         guard let url = configFileURL,
               let data = try? Data(contentsOf: url),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
+
+        if let captureSys = dict["capture_system_audio"] as? Bool {
+            self.captureSystemAudio = captureSys
+        }
+        if let diarize = dict["diarize_mic"] as? Bool {
+            self.diarizeMic = diarize
+        }
+        if let retention = dict["audio_retention"] as? String {
+            self.saveWav = (retention == "ArchiveWav")
+        }
+        if let cleanup = dict["cleanup_enabled"] as? Bool {
+            self.enableCleanup = cleanup
+        }
+        if let autoDetect = dict["auto_detect_calls"] as? Bool {
+            self.autoDetectCalls = autoDetect
+        }
         if let dropSync = dict["drop_sync_enabled"] as? Bool {
             self.dropSyncEnabled = dropSync
         }
         if let ics = dict["calendar_ics_urls"] as? [String] {
             self.calendarIcsUrls = ics
+        }
+        if let kws = dict["keywords"] as? [String] {
+            self.keywordsText = kws.joined(separator: ", ")
         }
     }
 
@@ -851,10 +895,19 @@ final class MimirController: ObservableObject {
         {
             dict = existing
         }
+        dict["capture_system_audio"] = captureSystemAudio
+        dict["diarize_mic"] = diarizeMic
+        dict["audio_retention"] = saveWav ? "ArchiveWav" : "Ephemeral"
+        dict["cleanup_enabled"] = enableCleanup
+        dict["auto_detect_calls"] = autoDetectCalls
         dict["drop_sync_enabled"] = dropSyncEnabled
         dict["calendar_ics_urls"] = calendarIcsUrls
+        dict["keywords"] = keywordsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         if let encoded = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
-            try? encoded.write(to: url)
+            try? encoded.write(to: url, options: .atomic)
         }
     }
 

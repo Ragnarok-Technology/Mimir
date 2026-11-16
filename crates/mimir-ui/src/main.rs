@@ -102,15 +102,17 @@ impl MimirDesktopApp {
         let (event_tx, event_rx) = mpsc::channel();
         let save_wav = matches!(cfg.audio_retention, AudioRetention::ArchiveWav);
         let encrypt_at_rest = cfg.encrypt_at_rest;
+        let diarize_mic = cfg.diarize_mic;
+        let keywords_input = cfg.keywords.join(", ");
         let mut app = Self {
             cfg,
             tab: Tab::Live,
             mini_mode: false,
             session_title: String::new(),
-            keywords_input: String::new(),
+            keywords_input,
             preset_name_input: String::new(),
             selected_preset_name: None,
-            diarize_mic: false,
+            diarize_mic,
             save_wav,
             encrypt_at_rest,
             is_recording: false,
@@ -1156,10 +1158,16 @@ impl eframe::App for MimirDesktopApp {
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("CAPTURE & EXPORTS").monospace().size(11.0).color(text_muted));
                             ui.add_space(6.0);
-                            ui.add_enabled(
-                                !self.is_recording,
-                                egui::Checkbox::new(&mut self.diarize_mic, "Multi-speaker mic diarization"),
-                            );
+                            if ui
+                                .add_enabled(
+                                    !self.is_recording,
+                                    egui::Checkbox::new(&mut self.diarize_mic, "Multi-speaker mic diarization"),
+                                )
+                                .changed()
+                            {
+                                self.cfg.diarize_mic = self.diarize_mic;
+                                let _ = self.cfg.save();
+                            }
                             if ui
                                 .add_enabled(
                                     !self.is_recording,
