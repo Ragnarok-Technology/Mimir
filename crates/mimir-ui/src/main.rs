@@ -1170,7 +1170,7 @@ impl eframe::App for MimirDesktopApp {
                                 self.cfg.audio_retention = if self.save_wav {
                                     AudioRetention::ArchiveWav
                                 } else {
-                                    AudioRetention::Discard
+                                    AudioRetention::Ephemeral
                                 };
                                 let _ = self.cfg.save();
                             }
