@@ -16,8 +16,9 @@ pub const WHISTLE_SAMPLE_RATE: u32 = 16_000;
 pub const WHISTLE_LANGUAGES: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
 
 /// Supported built-in summary templates.
-pub const SUMMARY_TEMPLATES: [&str; 5] = [
+pub const SUMMARY_TEMPLATES: [&str; 6] = [
     "general",
+    "meeting",
     "1on1",
     "standup",
     "sales_discovery",

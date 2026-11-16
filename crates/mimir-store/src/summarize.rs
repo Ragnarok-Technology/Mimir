@@ -7,6 +7,10 @@ use crate::export::format_hhmmss;
 /// Maximum character budget per prompt chunk for Qwen 2.5 0.5B Instruct.
 pub const DEFAULT_SUMMARY_CHUNK_CHARS: usize = 4200;
 
+/// Transcripts at or below this character count under the universal `general` template
+/// use a single fast LLM pass instead of multiple sequential passes.
+pub const SHORT_TRANSCRIPT_MAX_CHARS: usize = 900;
+
 /// Output produced by `SessionStore::summarize_session_with_progress`.
 #[derive(Debug, Clone)]
 pub struct SessionSummaryResult {
@@ -105,6 +109,7 @@ pub fn chunk_transcript_lines(lines: &[String], max_chars: usize) -> Vec<String>
 
 pub fn normalize_template_name(template: &str) -> &'static str {
     match template.trim().to_ascii_lowercase().as_str() {
+        "meeting" | "meeting_notes" => "meeting",
         "1on1" | "1-on-1" | "one_on_one" => "1on1",
         "standup" | "daily" => "standup",
         "sales_discovery" | "sales" | "discovery" => "sales_discovery",
@@ -115,16 +120,17 @@ pub fn normalize_template_name(template: &str) -> &'static str {
 
 pub fn template_sections_hint(template: &str) -> &'static str {
     match normalize_template_name(template) {
+        "meeting" => "Use these Markdown headings: ### Key Decisions, ### Discussion Points, ### Open Questions, ### Next Steps.",
         "1on1" => "Use these Markdown headings: ### Check-in & Wins, ### Feedback & Blockers, ### Open Questions, ### Next Steps.",
         "standup" => "Use these Markdown headings: ### Completed, ### In Progress, ### Blockers, ### Next Steps.",
         "sales_discovery" => "Use these Markdown headings: ### Customer Context & Pain Points, ### Requirements & Objections, ### Key Decisions, ### Next Steps.",
         "technical_review" => "Use these Markdown headings: ### Key Decisions, ### Architecture & Trade-offs, ### Open Questions, ### Next Steps.",
-        _ => "Use these Markdown headings: ### Key Decisions, ### Discussion Points, ### Open Questions, ### Next Steps.",
+        _ => "Match the actual content (voice note, conversation, lecture, video, or meeting). Use concise bullet points or a brief paragraph. Only include headings if the content clearly benefits from them; never force meeting structure onto non-meeting audio.",
     }
 }
 
 pub fn build_chunk_map_prompt(chunk: &str, chunk_idx: usize, total_chunks: usize) -> (String, String) {
-    let system = "You are a concise meeting note-taker. Summarize the key facts, decisions, questions, and action items from this transcript segment in 4-8 crisp bullet points. Preserve speaker names and timestamps when mentioned. Do not invent facts.";
+    let system = "Summarize the key points, facts, questions, and any explicit commitments from this transcript segment in 3-6 crisp bullet points. Preserve speaker names and timestamps when relevant. Do not invent facts or assume it is a meeting if it is not.";
     let user = format!("Transcript segment {}/{}:\n\n{}", chunk_idx + 1, total_chunks, chunk);
     (system.to_string(), user)
 }
@@ -134,12 +140,18 @@ pub fn build_summary_reduce_prompt(
     template: &str,
     context_hint: Option<&str>,
 ) -> (String, String) {
-    let sections = template_sections_hint(template);
+    let norm = normalize_template_name(template);
+    let sections = template_sections_hint(norm);
     let ctx = context_hint
-        .map(|c| format!(" Meeting context: {c}."))
+        .map(|c| format!(" Topic/Title: {c}."))
         .unwrap_or_default();
+    let role = if norm == "general" {
+        "You are a concise, accurate summarizer."
+    } else {
+        "You are an executive note-taker."
+    };
     let system = format!(
-        "You are an executive meeting assistant. Produce a clean, factual Markdown summary strictly grounded in the transcript.{ctx} {sections} Keep each section concise with bullet points. Do not invent details."
+        "{role} Produce a clean, factual Markdown summary strictly grounded in the transcript.{ctx} {sections} Keep it proportional to the input length and do not invent details."
     );
     (system, transcript_or_notes.to_string())
 }
@@ -151,14 +163,119 @@ pub fn build_action_items_prompt(transcript_or_notes: &str, speakers: &[String])
         format!(" Known speakers: {}.", speakers.join(", "))
     };
     let system = format!(
-        "Extract concrete action items and follow-ups from the transcript.{speaker_hint} Output ONLY a valid JSON array of objects with keys \"owner\" (string or null), \"task\" (string), \"due_hint\" (string or null), and \"timestamp\" (string like \"00:04:12\" or null). If there are no action items, output []."
+        "Extract ONLY explicit tasks, commitments, or follow-ups stated in the transcript.{speaker_hint} Output ONLY a valid JSON array of objects with keys \"owner\" (string or null), \"task\" (string), \"due_hint\" (string or null), and \"timestamp\" (string like \"00:04:12\" or null). If none were stated, immediately output []."
     );
     (system, transcript_or_notes.to_string())
 }
 
 pub fn build_auto_title_prompt(summary_or_transcript: &str) -> (String, String) {
-    let system = "Generate a concise 3 to 7 word meeting title describing the main topic. Output ONLY the title text with no quotes, no markdown, and no prefix.";
+    let system = "Generate a concise 3 to 7 word title describing the main topic of this transcript. Output ONLY the title text with no quotes, no markdown, and no prefix.";
     (system.to_string(), summary_or_transcript.to_string())
+}
+
+/// Single-pass prompt for short transcripts under the universal `general` mode.
+pub fn build_short_universal_summary_prompt(
+    transcript: &str,
+    needs_title: bool,
+    context_hint: Option<&str>,
+) -> (String, String) {
+    let ctx = context_hint
+        .map(|c| format!(" Topic/Title: {c}."))
+        .unwrap_or_default();
+    let title_instr = if needs_title {
+        "Start with \"Title: <3-6 word title>\" on the first line, then a blank line, then the summary. "
+    } else {
+        ""
+    };
+    let system = format!(
+        "You are a concise, accurate summarizer.{ctx} {title_instr}Summarize this short transcript in 1-3 brief sentences or bullet points, matching what the speaker actually said (note, thought, conversation, or clip—do not force meeting-notes formatting). Only add an \"Action Items:\" bullet list at the end if explicit tasks or commitments were stated; otherwise omit it. Do not invent facts."
+    );
+    (system, transcript.to_string())
+}
+
+/// Parses output from `build_short_universal_summary_prompt` into `(auto_title, summary_markdown, action_items)`.
+pub fn parse_short_universal_response(raw: &str, needs_title: bool) -> (Option<String>, String, Vec<ActionItem>) {
+    let mut lines: Vec<&str> = raw.trim().lines().collect();
+    let mut auto_title = None;
+
+    if needs_title && !lines.is_empty() {
+        let first = lines[0].trim();
+        if let Some(rest) = first
+            .strip_prefix("Title:")
+            .or_else(|| first.strip_prefix("title:"))
+            .or_else(|| first.strip_prefix("Topic:"))
+        {
+            auto_title = sanitize_auto_title(rest);
+            lines.remove(0);
+            while lines.first().is_some_and(|l| l.trim().is_empty()) {
+                lines.remove(0);
+            }
+        }
+    }
+
+    let mut summary_lines = Vec::new();
+    let mut action_items = Vec::new();
+    let mut in_actions = false;
+
+    for line in lines {
+        let trimmed = line.trim();
+        let lower = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+        if lower == "action items:" || lower == "action items" || lower == "next steps:" {
+            in_actions = true;
+            continue;
+        }
+        if in_actions {
+            let task = trimmed
+                .strip_prefix("- [ ] ")
+                .or_else(|| trimmed.strip_prefix("- "))
+                .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| trimmed.strip_prefix("• "))
+                .map(str::trim);
+            if let Some(t) = task {
+                if !t.is_empty() && !t.eq_ignore_ascii_case("none") && !t.eq_ignore_ascii_case("n/a") {
+                    action_items.push(ActionItem {
+                        owner: None,
+                        task: t.to_string(),
+                        due_hint: None,
+                        timestamp: None,
+                    });
+                }
+            } else if !trimmed.is_empty() {
+                in_actions = false;
+                summary_lines.push(line);
+            }
+        } else {
+            summary_lines.push(line);
+        }
+    }
+
+    let summary_markdown = summary_lines.join("\n").trim().to_string();
+    (auto_title, summary_markdown, action_items)
+}
+
+/// Heuristic check to avoid running an extra action-items LLM pass on monologues/notes with no task cues.
+pub fn should_extract_action_items(text: &str, speaker_count: usize) -> bool {
+    if speaker_count > 1 {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    const CUES: [&str; 14] = [
+        "will ",
+        "need to ",
+        "needs to ",
+        "have to ",
+        "should ",
+        "todo",
+        "action item",
+        "follow up",
+        "follow-up",
+        "remind me",
+        "deadline",
+        "by monday",
+        "by friday",
+        "next step",
+    ];
+    CUES.iter().any(|cue| lower.contains(cue))
 }
 
 /// Parses Qwen's action-items response into `Vec<ActionItem>`, tolerating code fences or bullet fallback.
@@ -285,5 +402,22 @@ mod tests {
             Some("Local Qwen Roadmap Sync".to_string())
         );
         assert_eq!(sanitize_auto_title("   "), None);
+    }
+
+    #[test]
+    fn parses_short_universal_response_without_forcing_meeting_format() {
+        let raw = "Title: Quick Grocery Reminder\n\nPick up oat milk and coffee beans on the way home.\n\nAction Items:\n- Buy oat milk\n- Buy coffee beans";
+        let (title, summary, actions) = parse_short_universal_response(raw, true);
+        assert_eq!(title.as_deref(), Some("Quick Grocery Reminder"));
+        assert_eq!(summary, "Pick up oat milk and coffee beans on the way home.");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].task, "Buy oat milk");
+    }
+
+    #[test]
+    fn skips_action_items_for_plain_monologue_without_cues() {
+        assert!(!should_extract_action_items("Just thinking out loud about how nice the weather is today.", 1));
+        assert!(should_extract_action_items("I need to send the invoice by Friday.", 1));
+        assert!(should_extract_action_items("Hello there.", 2));
     }
 }

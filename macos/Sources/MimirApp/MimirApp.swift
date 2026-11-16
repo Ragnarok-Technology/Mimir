@@ -760,6 +760,7 @@ struct SessionsTab: View {
 
                 Picker("Template", selection: $controller.selectedSummaryTemplate) {
                     Text("General").tag("general")
+                    Text("Meeting").tag("meeting")
                     Text("1-on-1").tag("1on1")
                     Text("Standup").tag("standup")
                     Text("Sales").tag("sales_discovery")

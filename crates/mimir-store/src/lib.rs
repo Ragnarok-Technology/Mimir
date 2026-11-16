@@ -657,9 +657,52 @@ impl SessionStore {
         }
 
         let chunks = summarize::chunk_transcript_lines(&lines, summarize::DEFAULT_SUMMARY_CHUNK_CHARS);
-        let map_steps = if chunks.len() > 1 { chunks.len() } else { 0 };
         let needs_title = summarize::is_default_or_timestamped_title(session.title.as_deref());
-        let total_steps = map_steps + 2 + usize::from(needs_title);
+        let context_hint = session
+            .title
+            .as_deref()
+            .filter(|t| !summarize::is_default_or_timestamped_title(Some(t)));
+
+        // Fast single-pass path for short transcripts under the universal `general` mode.
+        if chunks.len() == 1
+            && chunks[0].len() <= summarize::SHORT_TRANSCRIPT_MAX_CHARS
+            && norm_template == "general"
+        {
+            on_progress(0, 1);
+            let (sys, usr) = summarize::build_short_universal_summary_prompt(
+                &chunks[0],
+                needs_title,
+                context_hint,
+            );
+            let max_tokens = (chunks[0].len() / 4).clamp(80, 160);
+            let raw = complete(&sys, &usr, max_tokens)?;
+            let (auto_title, summary_markdown, action_items) =
+                summarize::parse_short_universal_response(&raw, needs_title);
+            if let Some(ref t) = auto_title {
+                let _ = self.rename_session(session_id, t);
+            }
+            let action_items_json = serde_json::to_string(&action_items)
+                .map_err(|e| MimirError::Storage(e.to_string()))?;
+            self.update_session_summary(
+                session_id,
+                Some(&summary_markdown),
+                Some(&norm_template),
+                Some(&action_items_json),
+            )?;
+            on_progress(1, 1);
+            return Ok(summarize::SessionSummaryResult {
+                summary_markdown,
+                summary_template: norm_template,
+                action_items,
+                action_items_json,
+                auto_title,
+            });
+        }
+
+        let map_steps = if chunks.len() > 1 { chunks.len() } else { 0 };
+        let run_actions = norm_template != "general"
+            || summarize::should_extract_action_items(&chunks.join("\n"), session.speakers.len());
+        let total_steps = map_steps + 1 + usize::from(run_actions) + usize::from(needs_title);
         let mut done = 0usize;
         on_progress(done, total_steps);
 
@@ -667,7 +710,7 @@ impl SessionStore {
             let mut partials = Vec::with_capacity(chunks.len());
             for (idx, chunk) in chunks.iter().enumerate() {
                 let (sys, usr) = summarize::build_chunk_map_prompt(chunk, idx, chunks.len());
-                let note = complete(&sys, &usr, 220)?;
+                let note = complete(&sys, &usr, 160)?;
                 if !note.trim().is_empty() {
                     partials.push(note.trim().to_string());
                 }
@@ -679,25 +722,30 @@ impl SessionStore {
             chunks[0].clone()
         };
 
-        let context_hint = session.title.as_deref().filter(|t| !summarize::is_default_or_timestamped_title(Some(t)));
+        let summary_budget = (combined_notes.len() / 7).clamp(160, 360);
         let (sum_sys, sum_usr) =
             summarize::build_summary_reduce_prompt(&combined_notes, &norm_template, context_hint);
-        let summary_markdown = complete(&sum_sys, &sum_usr, 420)?.trim().to_string();
+        let summary_markdown = complete(&sum_sys, &sum_usr, summary_budget)?.trim().to_string();
         done += 1;
         on_progress(done, total_steps);
 
-        let speaker_labels: Vec<String> = session
-            .speakers
-            .values()
-            .map(|s| s.label.clone())
-            .collect();
-        let (act_sys, act_usr) = summarize::build_action_items_prompt(&combined_notes, &speaker_labels);
-        let raw_actions = complete(&act_sys, &act_usr, 320)?;
-        let action_items = summarize::parse_action_items_response(&raw_actions);
+        let action_items = if run_actions {
+            let speaker_labels: Vec<String> = session
+                .speakers
+                .values()
+                .map(|s| s.label.clone())
+                .collect();
+            let (act_sys, act_usr) =
+                summarize::build_action_items_prompt(&combined_notes, &speaker_labels);
+            let raw_actions = complete(&act_sys, &act_usr, 180)?;
+            done += 1;
+            on_progress(done, total_steps);
+            summarize::parse_action_items_response(&raw_actions)
+        } else {
+            Vec::new()
+        };
         let action_items_json = serde_json::to_string(&action_items)
             .map_err(|e| MimirError::Storage(e.to_string()))?;
-        done += 1;
-        on_progress(done, total_steps);
 
         let auto_title = if needs_title {
             let title_input = if summary_markdown.is_empty() {
@@ -706,7 +754,7 @@ impl SessionStore {
                 summary_markdown.as_str()
             };
             let (title_sys, title_usr) = summarize::build_auto_title_prompt(title_input);
-            let raw_title = complete(&title_sys, &title_usr, 32)?;
+            let raw_title = complete(&title_sys, &title_usr, 24)?;
             let sanitized = summarize::sanitize_auto_title(&raw_title);
             if let Some(ref t) = sanitized {
                 let _ = self.rename_session(session_id, t);
@@ -1160,6 +1208,40 @@ mod tests {
         assert!(synced.is_some());
         let (md_path, _) = synced.unwrap();
         assert!(std::fs::read_to_string(md_path).unwrap().contains("## Summary (technical_review)"));
+    }
+
+    #[test]
+    fn short_universal_summary_uses_single_llm_pass() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let session = Session::new(None, vec![]);
+        store.create_session(&session).unwrap();
+        let u1 = sample_utterance(
+            ChannelId::Mic,
+            "host",
+            0,
+            "Remember to grab coffee beans on the way home.",
+        );
+        store.append_utterance(session.id, &u1).unwrap();
+
+        let mut call_count = 0usize;
+        let res = store
+            .summarize_session_with_progress(
+                session.id,
+                "general",
+                |_sys, _usr, max_tok| {
+                    call_count += 1;
+                    assert!(max_tok <= 160);
+                    Ok("Title: Coffee Beans Reminder\n\nReminder to pick up coffee beans on the way home.".into())
+                },
+                |_done, _total| {},
+            )
+            .unwrap();
+
+        assert_eq!(call_count, 1);
+        assert_eq!(res.auto_title.as_deref(), Some("Coffee Beans Reminder"));
+        assert!(!res.summary_markdown.contains("Key Decisions"));
+        assert!(res.action_items.is_empty());
     }
 }
 
