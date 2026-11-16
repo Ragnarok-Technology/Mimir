@@ -1,7 +1,12 @@
+mod ui_kit;
 mod updater;
 
 use chrono::Utc;
 use eframe::egui;
+use ui_kit::{
+    ButtonVariant, action_button, apply_obsidian_prism_theme, badge_pill, empty_state, palette,
+    pill_tab, section_card, session_card_row, styled_text_input, toggle_switch,
+};
 use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
@@ -703,40 +708,63 @@ impl eframe::App for MimirDesktopApp {
         let text_muted = egui::Color32::from_rgb(100, 116, 139);   // #64748B
 
         egui::TopBottomPanel::top("top_telemetry")
-            .frame(egui::Frame::new().fill(rail_bg).inner_margin(egui::Margin::symmetric(14, 9)))
+            .frame(
+                egui::Frame::new()
+                    .fill(rail_bg)
+                    .stroke(egui::Stroke::new(1.0, hairline))
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    draw_grayscale_mimir_mark(ui, 18.0);
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("M I M I R").strong().size(13.5).color(text_primary));
+                    draw_grayscale_mimir_mark(ui, 20.0);
                     ui.add_space(6.0);
-                    let status_text = if self.is_recording { "● LIVE · CAPTURING" } else { "● STANDBY" };
-                    let status_col = if self.is_recording { ice } else { cyan };
-                    ui.label(egui::RichText::new(status_text).monospace().size(11.0).color(status_col));
+                    ui.label(egui::RichText::new("M I M I R").strong().size(13.5).color(text_primary));
+                    ui.add_space(8.0);
+                    if self.is_recording {
+                        badge_pill(ui, "● LIVE", ice, active_bg);
+                    } else {
+                        badge_pill(ui, "● STANDBY", cyan, palette::VOID_BG);
+                    }
                     ui.add_space(10.0);
                     let mic_lvl = f32::from_bits(self.mic_level.load(Ordering::Relaxed));
                     let sys_lvl = f32::from_bits(self.sys_level.load(Ordering::Relaxed));
                     draw_level_meter(ui, "MIC", mic_lvl, cyan, hairline, text_muted);
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     draw_level_meter(ui, "SYS", sys_lvl, azure, hairline, text_muted);
-                    ui.add_space(12.0);
+                    ui.add_space(14.0);
                     if !self.mini_mode {
-                        ui.selectable_value(&mut self.tab, Tab::Live, "Live");
-                        ui.selectable_value(&mut self.tab, Tab::Transcripts, "Transcripts");
-                        ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                        egui::Frame::new()
+                            .fill(palette::VOID_BG)
+                            .stroke(egui::Stroke::new(1.0, hairline))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(4, 3))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    if pill_tab(ui, "Live", self.tab == Tab::Live).clicked() {
+                                        self.tab = Tab::Live;
+                                    }
+                                    if pill_tab(ui, "Transcripts", self.tab == Tab::Transcripts).clicked() {
+                                        self.tab = Tab::Transcripts;
+                                    }
+                                    if pill_tab(ui, "Settings", self.tab == Tab::Settings).clicked() {
+                                        self.tab = Tab::Settings;
+                                    }
+                                });
+                            });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Hide").clicked() {
+                        if action_button(ui, "Hide", ButtonVariant::Ghost).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
-                        let mini_label = if self.mini_mode { "Full View" } else { "Mini Mode" };
-                        if ui.button(mini_label).clicked() {
+                        let mini_label = if self.mini_mode { "Full View" } else { "Mini" };
+                        if action_button(ui, mini_label, ButtonVariant::Ghost).clicked() {
                             self.mini_mode = !self.mini_mode;
                             if self.mini_mode {
                                 self.tab = Tab::Live;
                             }
                         }
-                        if ui.button("Copy Latest").clicked() {
+                        if action_button(ui, "Copy Latest", ButtonVariant::Secondary).clicked() {
                             if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
                                 && let Ok(list) = store.list_sessions_filtered(1, false)
                                 && let Some(latest) = list.first()
@@ -752,7 +780,7 @@ impl eframe::App for MimirDesktopApp {
                                 self.status_line = "No sessions available to copy.".into();
                             }
                         }
-                        if ui.button("Connect AI (MCP)").clicked() {
+                        if action_button(ui, "Connect AI", ButtonVariant::Secondary).clicked() {
                             let home = dirs::home_dir().unwrap_or_else(|| self.cfg.data_dir.clone());
                             let mimir_bin = std::env::current_exe()
                                 .ok()
@@ -788,30 +816,51 @@ impl eframe::App for MimirDesktopApp {
             });
 
         egui::TopBottomPanel::bottom("action_dock")
-            .frame(egui::Frame::new().fill(rail_bg).inner_margin(egui::Margin::symmetric(14, 7)))
+            .frame(
+                egui::Frame::new()
+                    .fill(rail_bg)
+                    .stroke(egui::Stroke::new(1.0, hairline))
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Copy Markdown").clicked() && !self.selected_markdown.is_empty() {
+                    if !self.selected_markdown.is_empty()
+                        && action_button(ui, "Copy Markdown", ButtonVariant::Ghost).clicked()
+                    {
                         ctx.copy_text(self.selected_markdown.clone());
                         self.status_line = "Copied transcript to clipboard.".into();
                     }
                     ui.label(egui::RichText::new(&self.status_line).monospace().size(11.0).color(text_muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("whistle.cact · 100% local · zero telemetry").monospace().size(10.5).color(text_muted));
+                        let enc_badge = if self.encrypt_at_rest {
+                            "whistle.cact · local · encrypted"
+                        } else {
+                            "whistle.cact · 100% local"
+                        };
+                        ui.label(egui::RichText::new(enc_badge).monospace().size(10.5).color(text_muted));
                     });
                 });
             });
 
         if !self.mini_mode {
             egui::SidePanel::left("left_rail")
-                .exact_width(228.0)
-                .frame(egui::Frame::new().fill(rail_bg).inner_margin(egui::Margin::same(14)))
+                .exact_width(244.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(rail_bg)
+                        .stroke(egui::Stroke::new(1.0, hairline))
+                        .inner_margin(egui::Margin::same(14)),
+                )
                 .show(ctx, |ui| {
                     let btn_text = if self.is_recording { "■  Stop Capture" } else { "●  Start Capture" };
-                    let cta = egui::Button::new(egui::RichText::new(btn_text).strong().color(text_primary))
-                        .fill(active_bg)
-                        .stroke(egui::Stroke::new(1.0, if self.is_recording { ice } else { cyan }))
-                        .min_size(egui::vec2(ui.available_width(), 34.0));
+                    let cta_fill = if self.is_recording { palette::DANGER_BG } else { active_bg };
+                    let cta_stroke = if self.is_recording { palette::DANGER } else { cyan };
+                    let cta_text = if self.is_recording { palette::DANGER } else { ice };
+                    let cta = egui::Button::new(egui::RichText::new(btn_text).strong().size(13.0).color(cta_text))
+                        .fill(cta_fill)
+                        .stroke(egui::Stroke::new(1.0, cta_stroke))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(ui.available_width(), 38.0));
                     if ui.add(cta).clicked() {
                         if self.is_recording {
                             self.stop_recording();
@@ -820,36 +869,46 @@ impl eframe::App for MimirDesktopApp {
                         }
                     }
 
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-
+                    ui.add_space(14.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("SESSIONS").monospace().size(10.0).color(text_muted));
+                        ui.label(egui::RichText::new("SESSIONS").monospace().size(10.5).strong().color(text_muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("↻").clicked() {
+                            if action_button(ui, "↻", ButtonVariant::Ghost).clicked() {
                                 self.refresh_sessions();
                             }
                             let filter_lbl = if self.show_archived { "All" } else { "Active" };
-                            if ui.small_button(filter_lbl).clicked() {
+                            if action_button(ui, filter_lbl, ButtonVariant::Ghost).clicked() {
                                 self.show_archived = !self.show_archived;
                                 self.refresh_sessions();
                             }
                         });
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical().id_salt("rail_sessions").show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
                         let items = self.sessions.clone();
+                        if items.is_empty() {
+                            ui.add_space(16.0);
+                            ui.label(egui::RichText::new("No sessions yet.").size(12.0).color(text_muted));
+                        }
                         for s in items {
                             let selected = self.selected_session_id == Some(s.id);
-                            let arch_tag = if s.archived { " · archived" } else { "" };
-                            let label = format!(
-                                "{}\n{} turns{}",
-                                s.title.as_deref().unwrap_or("Untitled"),
-                                s.utterance_count,
-                                arch_tag
+                            let meta = format!(
+                                "{} · {} turns",
+                                s.started_at.format("%b %d %H:%M"),
+                                s.utterance_count
                             );
-                            if ui.selectable_label(selected, label).clicked() {
+                            if session_card_row(
+                                ui,
+                                s.id,
+                                s.title.as_deref().unwrap_or("Untitled"),
+                                &meta,
+                                s.has_summary,
+                                s.archived,
+                                selected,
+                            )
+                            .clicked()
+                            {
                                 self.load_session(s.id);
                                 self.tab = Tab::Transcripts;
                             }
@@ -858,7 +917,9 @@ impl eframe::App for MimirDesktopApp {
                 });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(palette::VOID_BG).inner_margin(egui::Margin::same(16)))
+            .show(ctx, |ui| match self.tab {
             Tab::Live => {
                 if !self.is_recording && !self.calendar_events.is_empty() {
                     let events_snapshot = self.calendar_events.clone();
@@ -875,124 +936,136 @@ impl eframe::App for MimirDesktopApp {
                         egui::Frame::new()
                             .fill(active_bg)
                             .stroke(egui::Stroke::new(1.0, cyan))
-                            .corner_radius(8)
-                            .inner_margin(egui::Margin::same(10))
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new("UPCOMING MEETING").monospace().size(10.0).color(ice));
-                                    ui.label(egui::RichText::new(&ev.title).strong().color(text_primary));
-                                    ui.label(egui::RichText::new(format!("· {timing} · {} attendee(s)", ev.attendees.len())).color(text_muted));
-                                    if ev.meeting_url.is_some()
-                                        && ui.button(egui::RichText::new("Join & Record").strong().color(ice)).clicked()
-                                    {
-                                        self.join_and_record_event(ev, true);
-                                    }
-                                    if ui.button("Record Only").clicked() {
-                                        self.join_and_record_event(ev, false);
-                                    }
-                                });
-                            });
-                        ui.add_space(6.0);
-                    }
-                }
-                ui.horizontal(|ui| {
-                    ui.add_enabled(
-                        !self.is_recording,
-                        egui::TextEdit::singleline(&mut self.session_title)
-                            .hint_text("Session title (optional)"),
-                    );
-                    ui.add_enabled(
-                        !self.is_recording,
-                        egui::TextEdit::singleline(&mut self.keywords_input)
-                            .hint_text("Keywords (comma-separated)"),
-                    );
-                    if !self.mini_mode && !self.cfg.keyword_presets.is_empty() {
-                        let selected_lbl = self
-                            .selected_preset_name
-                            .as_deref()
-                            .unwrap_or("Preset…");
-                        egui::ComboBox::from_id_salt("kw_preset_combo")
-                            .selected_text(selected_lbl)
-                            .show_ui(ui, |ui| {
-                                let presets = self.cfg.keyword_presets.clone();
-                                for p in presets {
-                                    let is_sel = self.selected_preset_name.as_deref() == Some(&p.name);
-                                    if ui.selectable_label(is_sel, &p.name).clicked() {
-                                        self.selected_preset_name = Some(p.name.clone());
-                                        self.preset_name_input = p.name.clone();
-                                        self.keywords_input = p.keywords.join(", ");
-                                    }
-                                }
-                            });
-                    }
-                    if self.mini_mode {
-                        let btn_label = if self.is_recording { "Stop" } else { "Capture" };
-                        if ui.button(btn_label).clicked() {
-                            if self.is_recording {
-                                self.stop_recording();
-                            } else {
-                                self.start_recording();
-                            }
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                    if self.live_lines.is_empty() {
-                        egui::Frame::new()
-                            .fill(card_bg)
-                            .stroke(egui::Stroke::new(1.0, hairline))
-                            .corner_radius(8)
+                            .corner_radius(10)
                             .inner_margin(egui::Margin::same(14))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Ready to refract dual-channel audio locally.").strong().color(text_primary));
-                                ui.label(egui::RichText::new("Press Start Capture to transcribe mic (Cyan) and system audio (Azure) with Whistle AI.").color(text_muted));
-                            });
-                    } else {
-                        for line in &self.live_lines {
-                            let is_sys = line.contains("[System]") || line.contains("System");
-                            let bar_col = if is_sys { azure } else { cyan };
-                            egui::Frame::new()
-                                .fill(card_bg)
-                                .stroke(egui::Stroke::new(1.0, hairline))
-                                .corner_radius(8)
-                                .inner_margin(egui::Margin::same(10))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 20.0), egui::Sense::hover());
-                                        ui.painter().rect_filled(rect, 1.5, bar_col);
-                                        ui.label(egui::RichText::new(line).color(text_primary));
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal_wrapped(|ui| {
+                                    badge_pill(ui, "UPCOMING", ice, palette::VOID_BG);
+                                    ui.label(egui::RichText::new(&ev.title).strong().size(13.5).color(text_primary));
+                                    ui.label(egui::RichText::new(format!("· {timing} · {} attendee(s)", ev.attendees.len())).color(palette::TEXT_SECONDARY));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if action_button(ui, "Record Only", ButtonVariant::Secondary).clicked() {
+                                            self.join_and_record_event(ev, false);
+                                        }
+                                        if ev.meeting_url.is_some()
+                                            && action_button(ui, "Join & Record", ButtonVariant::Primary).clicked()
+                                        {
+                                            self.join_and_record_event(ev, true);
+                                        }
                                     });
                                 });
-                            ui.add_space(4.0);
-                        }
+                            });
+                        ui.add_space(10.0);
                     }
+                }
+                section_card(ui, "SESSION SETUP", None, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(!self.is_recording, |ui| {
+                            ui.allocate_ui(egui::vec2(240.0, 30.0), |ui| {
+                                styled_text_input(ui, &mut self.session_title, "Session title (optional)", Some(220.0));
+                            });
+                            ui.allocate_ui(egui::vec2(280.0, 30.0), |ui| {
+                                styled_text_input(ui, &mut self.keywords_input, "Keywords (comma-separated)", Some(260.0));
+                            });
+                        });
+                        if !self.mini_mode && !self.cfg.keyword_presets.is_empty() {
+                            let selected_lbl = self
+                                .selected_preset_name
+                                .as_deref()
+                                .unwrap_or("Preset…");
+                            egui::ComboBox::from_id_salt("kw_preset_combo")
+                                .selected_text(selected_lbl)
+                                .show_ui(ui, |ui| {
+                                    let presets = self.cfg.keyword_presets.clone();
+                                    for p in presets {
+                                        let is_sel = self.selected_preset_name.as_deref() == Some(&p.name);
+                                        if ui.selectable_label(is_sel, &p.name).clicked() {
+                                            self.selected_preset_name = Some(p.name.clone());
+                                            self.preset_name_input = p.name.clone();
+                                            self.keywords_input = p.keywords.join(", ");
+                                        }
+                                    }
+                                });
+                        }
+                        if self.mini_mode {
+                            let btn_label = if self.is_recording { "Stop" } else { "Capture" };
+                            let var = if self.is_recording { ButtonVariant::Danger } else { ButtonVariant::Primary };
+                            if action_button(ui, btn_label, var).clicked() {
+                                if self.is_recording {
+                                    self.stop_recording();
+                                } else {
+                                    self.start_recording();
+                                }
+                            }
+                        }
+                    });
                 });
+                ui.add_space(10.0);
+                egui::Frame::new()
+                    .fill(card_bg)
+                    .stroke(egui::Stroke::new(1.0, hairline))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_size(ui.available_size());
+                        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                            if self.live_lines.is_empty() {
+                                empty_state(
+                                    ui,
+                                    "Ready to capture locally",
+                                    "Press Start Capture to transcribe microphone (Cyan) and system audio (Azure) via Whistle AI.",
+                                );
+                            } else {
+                                for line in &self.live_lines {
+                                    let is_sys = line.contains("[System]") || line.contains("System");
+                                    let bar_col = if is_sys { azure } else { cyan };
+                                    egui::Frame::new()
+                                        .fill(palette::VOID_BG)
+                                        .stroke(egui::Stroke::new(1.0, hairline))
+                                        .corner_radius(8)
+                                        .inner_margin(egui::Margin::symmetric(12, 9))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 18.0), egui::Sense::hover());
+                                                ui.painter().rect_filled(rect, 1.5, bar_col);
+                                                ui.label(egui::RichText::new(line).size(13.0).color(text_primary));
+                                            });
+                                        });
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        });
+                    });
             }
             Tab::Transcripts => {
                 ui.horizontal(|ui| {
-                    let q_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("Search transcripts (FTS5)…"),
+                    let q_resp = styled_text_input(
+                        ui,
+                        &mut self.search_query,
+                        "Search transcripts…",
+                        Some(320.0),
                     );
                     if (q_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        || ui.button("Search").clicked()
+                        || action_button(ui, "Search", ButtonVariant::Primary).clicked()
                     {
                         self.run_search();
                     }
-                    if !self.search_results.is_empty() && ui.button("Clear").clicked() {
+                    if !self.search_results.is_empty()
+                        && action_button(ui, "Clear", ButtonVariant::Ghost).clicked()
+                    {
                         self.search_query.clear();
                         self.search_results.clear();
                     }
                 });
                 if !self.search_results.is_empty() {
-                    ui.add_space(4.0);
-                    egui::Frame::new()
-                        .fill(card_bg)
-                        .stroke(egui::Stroke::new(1.0, hairline))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    section_card(
+                        ui,
+                        "SEARCH RESULTS",
+                        Some(&format!("{} hit(s)", self.search_results.len())),
+                        |ui| {
                             egui::ScrollArea::vertical()
                                 .id_salt("search_hits")
                                 .max_height(130.0)
@@ -1010,214 +1083,251 @@ impl eframe::App for MimirDesktopApp {
                                         }
                                     }
                                 });
-                        });
+                        },
+                    );
                 }
-                ui.add_space(6.0);
+                ui.add_space(10.0);
                 if let Some(sel_id) = self.selected_session_id {
                     let is_archived = self
                         .sessions
                         .iter()
                         .find(|s| s.id == sel_id)
                         .is_some_and(|s| s.archived);
-                    ui.horizontal_wrapped(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.selected_title_edit)
-                                .desired_width(200.0)
-                                .hint_text("Session title…"),
-                        );
-                        if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                            || ui.button("Rename").clicked()
-                        {
-                            self.rename_selected_session();
-                        }
-                        let arch_lbl = if is_archived { "Unarchive" } else { "Archive" };
-                        if ui.button(arch_lbl).clicked() {
-                            self.toggle_archive_selected_session();
-                        }
-                        if self.confirm_delete_id == Some(sel_id) {
-                            if ui
-                                .button(egui::RichText::new("Confirm Delete").color(egui::Color32::LIGHT_RED))
-                                .clicked()
-                            {
-                                self.delete_selected_session(sel_id);
-                            }
-                            if ui.button("Cancel").clicked() {
-                                self.confirm_delete_id = None;
-                            }
-                        } else if ui
-                            .button(egui::RichText::new("Delete").color(egui::Color32::LIGHT_RED))
-                            .clicked()
-                        {
-                            self.confirm_delete_id = Some(sel_id);
-                        }
-                        if ui.button("Run Cleanup").clicked() {
-                            let data_dir = self.cfg.data_dir.clone();
-                            let (qwen_w, qwen_t) = resolve_qwen_paths(&self.cfg);
-                            let mut kws = self.cfg.keywords.clone();
-                            let tx = self.event_tx.clone();
-                            self.status_line = "Running local transcript cleanup…".into();
-                            self.cleanup_progress = Some((0, 0));
-                            std::thread::spawn(move || {
-                                let res: anyhow::Result<String> = (|| {
-                                    let store = SessionStore::open(&data_dir)?;
-                                    if let Some(sess) = store.get_session(sel_id)? {
-                                        for k in &sess.keywords_used {
-                                            if !kws.contains(k) {
-                                                kws.push(k.clone());
-                                            }
-                                        }
-                                    }
-                                    let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
-                                        Some(QwenCleanupModel::load(&qwen_w, &qwen_t)?)
-                                    } else {
-                                        None
-                                    };
-                                    let used_qwen = qwen.is_some();
-                                    let updated = store.cleanup_session_with_context_and_progress(
-                                        sel_id,
-                                        |utt, prev, next| {
-                                            let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
-                                            let base = basic_heuristic_cleanup(src, &kws);
-                                            let cleaned = if let Some(q) = qwen.as_mut() {
-                                                let (sys, usr) = build_qwen_cleanup_prompt_with_context(prev, &base, next, &kws);
-                                                match q.complete(&sys, &usr, 128) {
-                                                    Ok(cand) => sanitize_cleanup_edit(&base, &cand),
-                                                    Err(_) => base,
-                                                }
-                                            } else {
-                                                base
-                                            };
-                                            Ok(Some(cleaned))
-                                        },
-                                        |done, total| {
-                                            let _ = tx.send(UiEvent::CleanupProgress(done, total));
-                                        },
-                                    )?;
-                                    Ok(format!(
-                                        "Cleaned {updated} utterance(s) via {}",
-                                        if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
-                                    ))
-                                })();
-                                let msg = match res {
-                                    Ok(s) => s,
-                                    Err(e) => format!("Cleanup error: {e}"),
-                                };
-                                let _ = tx.send(UiEvent::CleanupDone);
-                                let _ = tx.send(UiEvent::Status(msg));
-                            });
-                        }
-                        if self.selected_has_cleaned && ui.button("Revert Raw").clicked() {
-                            if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
-                                && let Ok(n) = store.revert_session_cleanup(sel_id)
-                            {
-                                self.status_line = format!("Reverted {n} utterance(s) to raw text.");
-                                self.load_session(sel_id);
-                            }
-                        }
-                        let audio_dir = self.cfg.data_dir.join("audio");
-                        let has_audio = ["mic", "sys"].iter().any(|ch| {
-                            audio_dir.join(format!("{sel_id}_{ch}.wav")).is_file()
-                                || audio_dir.join(format!("{sel_id}_{ch}.wav.enc")).is_file()
-                        });
-                        if has_audio && ui.button("Export WAV").clicked() {
-                            let export_dir = self.cfg.data_dir.join("exports");
-                            let _ = std::fs::create_dir_all(&export_dir);
-                            let mut exported = 0usize;
-                            for ch in ["mic", "sys"] {
-                                let plain = audio_dir.join(format!("{sel_id}_{ch}.wav"));
-                                let enc = audio_dir.join(format!("{sel_id}_{ch}.wav.enc"));
-                                let out = export_dir.join(format!("{sel_id}_{ch}.wav"));
-                                if plain.is_file() {
-                                    if std::fs::copy(&plain, &out).is_ok() {
-                                        exported += 1;
-                                    }
-                                } else if enc.is_file()
-                                    && let Ok(raw) = std::fs::read(&enc)
-                                    && let Ok(dec) = decrypt_bytes_at_rest(&self.cfg.data_dir, &raw)
-                                    && std::fs::write(&out, dec).is_ok()
+                    egui::Frame::new()
+                        .fill(card_bg)
+                        .stroke(egui::Stroke::new(1.0, hairline))
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let resp = styled_text_input(
+                                    ui,
+                                    &mut self.selected_title_edit,
+                                    "Session title…",
+                                    Some(240.0),
+                                );
+                                if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    || action_button(ui, "Rename", ButtonVariant::Secondary).clicked()
                                 {
-                                    exported += 1;
+                                    self.rename_selected_session();
                                 }
-                            }
-                            self.status_line = if exported > 0 {
-                                format!("Exported {exported} WAV file(s) to {}", export_dir.display())
-                            } else {
-                                "Failed to export WAV archive.".into()
-                            };
-                        }
-                        if self.selected_has_cleaned || self.selected_has_summary {
-                            let primary_lbl = if self.selected_has_cleaned { "Cleaned" } else { "Transcript" };
-                            if ui
-                                .selectable_label(
-                                    !self.show_summary_panel && self.transcript_view == TranscriptView::Cleaned,
-                                    primary_lbl,
-                                )
-                                .clicked()
-                            {
-                                self.show_summary_panel = false;
-                                self.transcript_view = TranscriptView::Cleaned;
-                                self.load_session(sel_id);
-                            }
-                            if self.selected_has_cleaned {
-                                for (view, lbl) in [
-                                    (TranscriptView::Raw, "Raw"),
-                                    (TranscriptView::Diff, "Diff"),
-                                ] {
-                                    if ui
-                                        .selectable_label(!self.show_summary_panel && self.transcript_view == view, lbl)
-                                        .clicked()
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if self.confirm_delete_id == Some(sel_id) {
+                                        if action_button(ui, "Cancel", ButtonVariant::Ghost).clicked() {
+                                            self.confirm_delete_id = None;
+                                        }
+                                        if action_button(ui, "Confirm Delete", ButtonVariant::Danger).clicked() {
+                                            self.delete_selected_session(sel_id);
+                                        }
+                                    } else if action_button(ui, "Delete", ButtonVariant::Danger).clicked() {
+                                        self.confirm_delete_id = Some(sel_id);
+                                    }
+                                    let arch_lbl = if is_archived { "Unarchive" } else { "Archive" };
+                                    if action_button(ui, arch_lbl, ButtonVariant::Ghost).clicked() {
+                                        self.toggle_archive_selected_session();
+                                    }
+                                });
+                            });
+                            ui.add_space(10.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if self.selected_has_cleaned || self.selected_has_summary {
+                                    egui::Frame::new()
+                                        .fill(palette::VOID_BG)
+                                        .stroke(egui::Stroke::new(1.0, hairline))
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .inner_margin(egui::Margin::symmetric(4, 3))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                let primary_lbl = if self.selected_has_cleaned {
+                                                    "Cleaned"
+                                                } else {
+                                                    "Transcript"
+                                                };
+                                                if pill_tab(
+                                                    ui,
+                                                    primary_lbl,
+                                                    !self.show_summary_panel
+                                                        && self.transcript_view == TranscriptView::Cleaned,
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.show_summary_panel = false;
+                                                    self.transcript_view = TranscriptView::Cleaned;
+                                                    self.load_session(sel_id);
+                                                }
+                                                if self.selected_has_cleaned {
+                                                    for (view, lbl) in [
+                                                        (TranscriptView::Raw, "Raw"),
+                                                        (TranscriptView::Diff, "Diff"),
+                                                    ] {
+                                                        if pill_tab(
+                                                            ui,
+                                                            lbl,
+                                                            !self.show_summary_panel
+                                                                && self.transcript_view == view,
+                                                        )
+                                                        .clicked()
+                                                        {
+                                                            self.show_summary_panel = false;
+                                                            self.transcript_view = view;
+                                                            self.load_session(sel_id);
+                                                        }
+                                                    }
+                                                }
+                                                if self.selected_has_summary
+                                                    && pill_tab(ui, "Summary", self.show_summary_panel)
+                                                        .clicked()
+                                                {
+                                                    self.show_summary_panel = true;
+                                                }
+                                            });
+                                        });
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if action_button(ui, "Run Cleanup", ButtonVariant::Primary).clicked() {
+                                        let data_dir = self.cfg.data_dir.clone();
+                                        let (qwen_w, qwen_t) = resolve_qwen_paths(&self.cfg);
+                                        let mut kws = self.cfg.keywords.clone();
+                                        let tx = self.event_tx.clone();
+                                        self.status_line = "Running local transcript cleanup…".into();
+                                        self.cleanup_progress = Some((0, 0));
+                                        std::thread::spawn(move || {
+                                            let res: anyhow::Result<String> = (|| {
+                                                let store = SessionStore::open(&data_dir)?;
+                                                if let Some(sess) = store.get_session(sel_id)? {
+                                                    for k in &sess.keywords_used {
+                                                        if !kws.contains(k) {
+                                                            kws.push(k.clone());
+                                                        }
+                                                    }
+                                                }
+                                                let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                                                    Some(QwenCleanupModel::load(&qwen_w, &qwen_t)?)
+                                                } else {
+                                                    None
+                                                };
+                                                let used_qwen = qwen.is_some();
+                                                let updated = store.cleanup_session_with_context_and_progress(
+                                                    sel_id,
+                                                    |utt, prev, next| {
+                                                        let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
+                                                        let base = basic_heuristic_cleanup(src, &kws);
+                                                        let cleaned = if let Some(q) = qwen.as_mut() {
+                                                            let (sys, usr) = build_qwen_cleanup_prompt_with_context(prev, &base, next, &kws);
+                                                            match q.complete(&sys, &usr, 128) {
+                                                                Ok(cand) => sanitize_cleanup_edit(&base, &cand),
+                                                                Err(_) => base,
+                                                            }
+                                                        } else {
+                                                            base
+                                                        };
+                                                        Ok(Some(cleaned))
+                                                    },
+                                                    |done, total| {
+                                                        let _ = tx.send(UiEvent::CleanupProgress(done, total));
+                                                    },
+                                                )?;
+                                                Ok(format!(
+                                                    "Cleaned {updated} utterance(s) via {}",
+                                                    if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
+                                                ))
+                                            })();
+                                            let msg = match res {
+                                                Ok(s) => s,
+                                                Err(e) => format!("Cleanup error: {e}"),
+                                            };
+                                            let _ = tx.send(UiEvent::CleanupDone);
+                                            let _ = tx.send(UiEvent::Status(msg));
+                                        });
+                                    }
+                                    if self.selected_has_cleaned
+                                        && action_button(ui, "Revert Raw", ButtonVariant::Secondary).clicked()
+                                        && let Ok(store) = SessionStore::open(&self.cfg.data_dir)
+                                        && let Ok(n) = store.revert_session_cleanup(sel_id)
                                     {
-                                        self.show_summary_panel = false;
-                                        self.transcript_view = view;
+                                        self.status_line = format!("Reverted {n} utterance(s) to raw text.");
                                         self.load_session(sel_id);
                                     }
+                                    let audio_dir = self.cfg.data_dir.join("audio");
+                                    let has_audio = ["mic", "sys"].iter().any(|ch| {
+                                        audio_dir.join(format!("{sel_id}_{ch}.wav")).is_file()
+                                            || audio_dir.join(format!("{sel_id}_{ch}.wav.enc")).is_file()
+                                    });
+                                    if has_audio
+                                        && action_button(ui, "Export WAV", ButtonVariant::Secondary).clicked()
+                                    {
+                                        let export_dir = self.cfg.data_dir.join("exports");
+                                        let _ = std::fs::create_dir_all(&export_dir);
+                                        let mut exported = 0usize;
+                                        for ch in ["mic", "sys"] {
+                                            let plain = audio_dir.join(format!("{sel_id}_{ch}.wav"));
+                                            let enc = audio_dir.join(format!("{sel_id}_{ch}.wav.enc"));
+                                            let out = export_dir.join(format!("{sel_id}_{ch}.wav"));
+                                            if plain.is_file() {
+                                                if std::fs::copy(&plain, &out).is_ok() {
+                                                    exported += 1;
+                                                }
+                                            } else if enc.is_file()
+                                                && let Ok(raw) = std::fs::read(&enc)
+                                                && let Ok(dec) = decrypt_bytes_at_rest(&self.cfg.data_dir, &raw)
+                                                && std::fs::write(&out, dec).is_ok()
+                                            {
+                                                exported += 1;
+                                            }
+                                        }
+                                        self.status_line = if exported > 0 {
+                                            format!("Exported {exported} WAV file(s) to {}", export_dir.display())
+                                        } else {
+                                            "Failed to export WAV archive.".into()
+                                        };
+                                    }
+                                });
+                            });
+                            if let Some((done, total)) = self.cleanup_progress {
+                                ui.add_space(8.0);
+                                let frac = if total > 0 {
+                                    done as f32 / total as f32
+                                } else {
+                                    0.0
+                                };
+                                let label = if total > 0 {
+                                    format!("Cleaning {done} / {total} utterances…")
+                                } else {
+                                    "Loading Qwen 2.5 0.5B…".to_string()
+                                };
+                                ui.add(egui::ProgressBar::new(frac).text(label).animate(total == 0));
+                                ui.ctx().request_repaint();
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                styled_text_input(
+                                    ui,
+                                    &mut self.speaker_id_edit,
+                                    "Speaker ID (e.g. spk_1)",
+                                    Some(140.0),
+                                );
+                                styled_text_input(
+                                    ui,
+                                    &mut self.speaker_label_edit,
+                                    "New speaker name",
+                                    Some(180.0),
+                                );
+                                if action_button(ui, "Rename Speaker", ButtonVariant::Secondary).clicked() {
+                                    self.rename_speaker_inline(sel_id);
                                 }
-                            }
-                            if self.selected_has_summary
-                                && ui.selectable_label(self.show_summary_panel, "Summary").clicked()
-                            {
-                                self.show_summary_panel = true;
-                            }
-                        }
-                    });
-                    if let Some((done, total)) = self.cleanup_progress {
-                        let frac = if total > 0 {
-                            done as f32 / total as f32
-                        } else {
-                            0.0
-                        };
-                        let label = if total > 0 {
-                            format!("Cleaning {done} / {total} utterances…")
-                        } else {
-                            "Loading Qwen 2.5 0.5B…".to_string()
-                        };
-                        ui.add(egui::ProgressBar::new(frac).text(label).animate(total == 0));
-                        ui.ctx().request_repaint();
-                    }
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.speaker_id_edit)
-                                .desired_width(90.0)
-                                .hint_text("Speaker ID"),
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.speaker_label_edit)
-                                .desired_width(140.0)
-                                .hint_text("New speaker name"),
-                        );
-                        if ui.button("Rename Speaker").clicked() {
-                            self.rename_speaker_inline(sel_id);
-                        }
-                    });
-                    ui.add_space(6.0);
+                            });
+                        });
+                    ui.add_space(10.0);
                 }
                 egui::Frame::new()
                     .fill(card_bg)
                     .stroke(egui::Stroke::new(1.0, hairline))
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::same(12))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::same(16))
                     .show(ui, |ui| {
+                        ui.set_min_size(ui.available_size());
                         egui::ScrollArea::vertical().id_salt("sess_md").show(ui, |ui| {
                             if self.show_summary_panel {
                                 if let Some(ref summary) = self.selected_summary {
@@ -1226,20 +1336,19 @@ impl eframe::App for MimirDesktopApp {
                                         _ => "SUMMARY".to_string(),
                                     };
                                     ui.label(egui::RichText::new(hdr).monospace().size(11.0).color(ice));
-                                    ui.add_space(4.0);
+                                    ui.add_space(6.0);
                                     render_markdown_view(ui, summary, ice, cyan, text_primary, text_muted, hairline);
                                 } else {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "No summary saved yet — your MCP assistant can generate and store one via save_summary.",
-                                        )
-                                        .color(text_muted),
+                                    empty_state(
+                                        ui,
+                                        "No summary saved yet",
+                                        "Your MCP assistant can generate and store one via save_summary.",
                                     );
                                 }
                                 if !self.selected_action_items.is_empty() {
-                                    ui.add_space(10.0);
+                                    ui.add_space(12.0);
                                     ui.label(egui::RichText::new("ACTION ITEMS").monospace().size(11.0).color(cyan));
-                                    ui.add_space(4.0);
+                                    ui.add_space(6.0);
                                     for item in &self.selected_action_items {
                                         let owner = item.owner.as_deref().unwrap_or("Unassigned");
                                         let due = item
@@ -1254,12 +1363,17 @@ impl eframe::App for MimirDesktopApp {
                                             .unwrap_or_default();
                                         ui.label(
                                             egui::RichText::new(format!("• [{owner}] {}{due}{ts}", item.task))
+                                                .size(13.0)
                                                 .color(text_primary),
                                         );
                                     }
                                 }
                             } else if self.selected_markdown.is_empty() {
-                                ui.label(egui::RichText::new("Select a session from the left rail to view its Markdown.").color(text_muted));
+                                empty_state(
+                                    ui,
+                                    "No session selected",
+                                    "Select a session from the left rail to view its transcript.",
+                                );
                             } else {
                                 render_markdown_view(
                                     ui,
@@ -1276,325 +1390,359 @@ impl eframe::App for MimirDesktopApp {
             }
             Tab::Settings => {
                 egui::ScrollArea::vertical().id_salt("settings_scroll").show(ui, |ui| {
-                    egui::Frame::new()
-                        .fill(card_bg)
-                        .stroke(egui::Stroke::new(1.0, hairline))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("CAPTURE & EXPORTS").monospace().size(11.0).color(text_muted));
-                            ui.add_space(6.0);
-                            if ui
-                                .add_enabled(
-                                    !self.is_recording,
-                                    egui::Checkbox::new(
-                                        &mut self.cfg.capture_system_audio,
-                                        "Capture system audio",
-                                    ),
-                                )
-                                .changed()
+                    section_card(ui, "CAPTURE & PRIVACY", None, |ui| {
+                        ui.spacing_mut().item_spacing.y = 12.0;
+                        if toggle_switch(
+                            ui,
+                            &mut self.cfg.capture_system_audio,
+                            "Capture system audio",
+                            Some("Record remote meeting participants via OS audio loopback / ScreenCaptureKit."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.diarize_mic,
+                            "Multi-speaker mic diarization",
+                            Some("Separate multiple local speakers on the microphone channel."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            self.cfg.diarize_mic = self.diarize_mic;
+                            let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.save_wav,
+                            "Save local WAV archives",
+                            Some("Keep 16 kHz WAV recordings per session (encrypted when at-rest encryption is on)."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            self.cfg.audio_retention = if self.save_wav {
+                                AudioRetention::ArchiveWav
+                            } else {
+                                AudioRetention::Ephemeral
+                            };
+                            let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.cfg.cleanup_enabled,
+                            "Post-process transcript cleanup on stop",
+                            Some("Automatically run heuristic/Qwen transcript cleanup when capture stops."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.encrypt_at_rest,
+                            "At-rest encryption (SQLite, FTS5, WAL & WAV)",
+                            Some("Encrypt transcripts, search index, WAL files, and WAV archives with ChaCha20-Poly1305."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            self.cfg.encrypt_at_rest = self.encrypt_at_rest;
+                            let _ = self.cfg.save();
+                            if self.encrypt_at_rest
+                                && let Ok(store) = SessionStore::open_with_encryption(&self.cfg.data_dir, true)
+                                && let Ok(count) = store.encrypt_existing_data()
                             {
-                                let _ = self.cfg.save();
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.is_recording,
-                                    egui::Checkbox::new(&mut self.diarize_mic, "Multi-speaker mic diarization"),
-                                )
-                                .changed()
-                            {
-                                self.cfg.diarize_mic = self.diarize_mic;
-                                let _ = self.cfg.save();
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.is_recording,
-                                    egui::Checkbox::new(&mut self.save_wav, "Save local WAV archives"),
-                                )
-                                .changed()
-                            {
-                                self.cfg.audio_retention = if self.save_wav {
-                                    AudioRetention::ArchiveWav
-                                } else {
-                                    AudioRetention::Ephemeral
-                                };
-                                let _ = self.cfg.save();
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.is_recording,
-                                    egui::Checkbox::new(
-                                        &mut self.cfg.cleanup_enabled,
-                                        "Post-process transcript cleanup on stop",
-                                    ),
-                                )
-                                .changed()
-                            {
-                                let _ = self.cfg.save();
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.is_recording,
-                                    egui::Checkbox::new(
-                                        &mut self.encrypt_at_rest,
-                                        "Encrypt transcripts, search index, WAL & audio at rest",
-                                    ),
-                                )
-                                .changed()
-                            {
-                                self.cfg.encrypt_at_rest = self.encrypt_at_rest;
-                                let _ = self.cfg.save();
-                                if self.encrypt_at_rest
-                                    && let Ok(store) = SessionStore::open_with_encryption(&self.cfg.data_dir, true)
-                                    && let Ok(count) = store.encrypt_existing_data()
-                                {
-                                    self.status_line = format!(
-                                        "At-rest encryption enabled ({count} existing record(s) encrypted)."
-                                    );
-                                }
-                            }
-                            if ui
-                                .checkbox(
-                                    &mut self.cfg.drop_sync_enabled,
-                                    "Sync exports to Drop Folder on stop / cleanup / MCP save",
-                                )
-                                .changed()
-                            {
-                                let _ = self.cfg.save();
-                            }
-                        });
-                    ui.add_space(10.0);
-                    egui::Frame::new()
-                        .fill(card_bg)
-                        .stroke(egui::Stroke::new(1.0, hairline))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("KEYWORD PRESETS").monospace().size(11.0).color(text_muted));
-                            ui.add_space(6.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.preset_name_input)
-                                        .desired_width(140.0)
-                                        .hint_text("Preset name"),
+                                self.status_line = format!(
+                                    "At-rest encryption enabled ({count} existing record(s) encrypted)."
                                 );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.keywords_input)
-                                        .desired_width(240.0)
-                                        .hint_text("Keywords (comma-separated)"),
-                                );
-                                if ui.button("Save Preset").clicked() {
-                                    let name = self.preset_name_input.trim().to_string();
-                                    let kws: Vec<String> = self
-                                        .keywords_input
-                                        .split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect();
-                                    if !name.is_empty() {
-                                        if let Some(existing) = self
-                                            .cfg
-                                            .keyword_presets
-                                            .iter_mut()
-                                            .find(|p| p.name.eq_ignore_ascii_case(&name))
-                                        {
-                                            existing.keywords = kws;
-                                        } else {
-                                            self.cfg.keyword_presets.push(KeywordPreset {
-                                                name: name.clone(),
-                                                keywords: kws,
-                                            });
-                                        }
-                                        self.selected_preset_name = Some(name.clone());
-                                        let _ = self.cfg.save();
-                                        self.status_line = format!("Saved keyword preset '{name}'.");
+                            }
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.cfg.drop_sync_enabled,
+                            "Sync exports to Drop Folder",
+                            Some("Automatically write Markdown/JSONL exports on stop, cleanup, or MCP summary save."),
+                            true,
+                        )
+                        .changed()
+                        {
+                            let _ = self.cfg.save();
+                        }
+                    });
+                    ui.add_space(12.0);
+                    section_card(ui, "KEYWORD PRESETS", None, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            styled_text_input(
+                                ui,
+                                &mut self.preset_name_input,
+                                "Preset name",
+                                Some(160.0),
+                            );
+                            styled_text_input(
+                                ui,
+                                &mut self.keywords_input,
+                                "Keywords (comma-separated)",
+                                Some(280.0),
+                            );
+                            if action_button(ui, "Save Preset", ButtonVariant::Primary).clicked() {
+                                let name = self.preset_name_input.trim().to_string();
+                                let kws: Vec<String> = self
+                                    .keywords_input
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                if !name.is_empty() {
+                                    if let Some(existing) = self
+                                        .cfg
+                                        .keyword_presets
+                                        .iter_mut()
+                                        .find(|p| p.name.eq_ignore_ascii_case(&name))
+                                    {
+                                        existing.keywords = kws;
+                                    } else {
+                                        self.cfg.keyword_presets.push(KeywordPreset {
+                                            name: name.clone(),
+                                            keywords: kws,
+                                        });
                                     }
-                                }
-                            });
-                            if !self.cfg.keyword_presets.is_empty() {
-                                ui.add_space(6.0);
-                                let presets = self.cfg.keyword_presets.clone();
-                                let mut delete_name: Option<String> = None;
-                                for p in presets {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(&p.name).strong().color(text_primary));
-                                        ui.label(egui::RichText::new(p.keywords.join(", ")).color(text_muted));
-                                        if ui.small_button("Load").clicked() {
-                                            self.selected_preset_name = Some(p.name.clone());
-                                            self.preset_name_input = p.name.clone();
-                                            self.keywords_input = p.keywords.join(", ");
-                                        }
-                                        if ui.small_button("Delete").clicked() {
-                                            delete_name = Some(p.name.clone());
-                                        }
-                                    });
-                                }
-                                if let Some(del) = delete_name {
-                                    self.cfg.keyword_presets.retain(|p| !p.name.eq_ignore_ascii_case(&del));
-                                    if self.selected_preset_name.as_deref() == Some(&del) {
-                                        self.selected_preset_name = None;
-                                    }
+                                    self.selected_preset_name = Some(name.clone());
                                     let _ = self.cfg.save();
-                                    self.status_line = format!("Deleted keyword preset '{del}'.");
+                                    self.status_line = format!("Saved keyword preset '{name}'.");
                                 }
                             }
                         });
-                    ui.add_space(10.0);
-                    egui::Frame::new()
-                        .fill(card_bg)
-                        .stroke(egui::Stroke::new(1.0, hairline))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("CALENDAR").monospace().size(11.0).color(text_muted));
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.calendar_ics_input)
-                                        .desired_width(300.0)
-                                        .hint_text("https://...ics or /path/to/calendar.ics"),
-                                );
-                                if ui.button("Add .ics").clicked() {
-                                    let trimmed = self.calendar_ics_input.trim().to_string();
-                                    if !trimmed.is_empty() && !self.cfg.calendar_ics_urls.contains(&trimmed) {
-                                        self.cfg.calendar_ics_urls.push(trimmed);
-                                        self.calendar_ics_input.clear();
-                                        let _ = self.cfg.save();
-                                        self.refresh_calendar_events();
-                                    }
+                        if !self.cfg.keyword_presets.is_empty() {
+                            ui.add_space(10.0);
+                            let presets = self.cfg.keyword_presets.clone();
+                            let mut delete_name: Option<String> = None;
+                            for p in presets {
+                                egui::Frame::new()
+                                    .fill(palette::VOID_BG)
+                                    .stroke(egui::Stroke::new(1.0, hairline))
+                                    .corner_radius(egui::CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(&p.name).strong().color(text_primary));
+                                            ui.label(egui::RichText::new(p.keywords.join(", ")).color(text_muted));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if action_button(ui, "Delete", ButtonVariant::Danger).clicked() {
+                                                    delete_name = Some(p.name.clone());
+                                                }
+                                                if action_button(ui, "Load", ButtonVariant::Secondary).clicked() {
+                                                    self.selected_preset_name = Some(p.name.clone());
+                                                    self.preset_name_input = p.name.clone();
+                                                    self.keywords_input = p.keywords.join(", ");
+                                                }
+                                            });
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                            if let Some(del) = delete_name {
+                                self.cfg.keyword_presets.retain(|p| !p.name.eq_ignore_ascii_case(&del));
+                                if self.selected_preset_name.as_deref() == Some(&del) {
+                                    self.selected_preset_name = None;
                                 }
-                                if ui.button("Refresh Calendar").clicked() {
+                                let _ = self.cfg.save();
+                                self.status_line = format!("Deleted keyword preset '{del}'.");
+                            }
+                        }
+                    });
+                    ui.add_space(12.0);
+                    section_card(ui, "CALENDAR (ICS)", None, |ui| {
+                        ui.horizontal(|ui| {
+                            styled_text_input(
+                                ui,
+                                &mut self.calendar_ics_input,
+                                "https://...ics or /path/to/calendar.ics",
+                                Some(340.0),
+                            );
+                            if action_button(ui, "Add .ics", ButtonVariant::Primary).clicked() {
+                                let trimmed = self.calendar_ics_input.trim().to_string();
+                                if !trimmed.is_empty() && !self.cfg.calendar_ics_urls.contains(&trimmed) {
+                                    self.cfg.calendar_ics_urls.push(trimmed);
+                                    self.calendar_ics_input.clear();
+                                    let _ = self.cfg.save();
                                     self.refresh_calendar_events();
                                 }
-                            });
+                            }
+                            if action_button(ui, "Refresh", ButtonVariant::Secondary).clicked() {
+                                self.refresh_calendar_events();
+                            }
+                        });
+                        if !self.cfg.calendar_ics_urls.is_empty() {
+                            ui.add_space(8.0);
                             let mut remove_idx = None;
                             for (idx, url) in self.cfg.calendar_ics_urls.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.monospace(url);
-                                    if ui.small_button("Remove").clicked() {
-                                        remove_idx = Some(idx);
-                                    }
-                                });
+                                egui::Frame::new()
+                                    .fill(palette::VOID_BG)
+                                    .stroke(egui::Stroke::new(1.0, hairline))
+                                    .corner_radius(egui::CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.monospace(url);
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if action_button(ui, "Remove", ButtonVariant::Danger).clicked() {
+                                                    remove_idx = Some(idx);
+                                                }
+                                            });
+                                        });
+                                    });
+                                ui.add_space(4.0);
                             }
                             if let Some(idx) = remove_idx {
                                 self.cfg.calendar_ics_urls.remove(idx);
                                 let _ = self.cfg.save();
                                 self.refresh_calendar_events();
                             }
-                        });
-                    ui.add_space(10.0);
-                    egui::Frame::new()
-                        .fill(card_bg)
-                        .stroke(egui::Stroke::new(1.0, hairline))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("MCP & SUMMARIES").monospace().size(11.0).color(text_muted));
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Connect your AI assistant via MCP. Assistants read transcripts (`get_transcript`) and save or reuse summaries (`save_summary`, `get_summary`) using your preferred model.",
-                                )
-                                .color(text_muted),
-                            );
-                            ui.add_space(6.0);
-                            if ui.button("Connect Installed AI Assistants (MCP)").clicked() {
-                                if let (Some(home), Ok(exe)) = (dirs::home_dir(), std::env::current_exe()) {
-                                    let cli_bin = exe.with_file_name("mimir");
-                                    let target_bin = if cli_bin.exists() { cli_bin } else { exe };
-                                    match connect_detected_assistants(&home, &target_bin, false) {
-                                        Ok(outcomes) => {
-                                            self.connect_report = outcomes
-                                                .into_iter()
-                                                .map(|o| format!("[{}] {} -> {}", o.status, o.name, o.path.display()))
-                                                .collect::<Vec<_>>()
-                                                .join("\n");
-                                        }
-                                        Err(e) => self.connect_report = format!("Error: {e}"),
-                                    }
+                        }
+                    });
+                    ui.add_space(12.0);
+                    section_card(ui, "MCP & SUMMARIES", None, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Connect your AI assistant via MCP. Assistants read transcripts (get_transcript) and save or reuse summaries (save_summary, get_summary) using your preferred model.",
+                            )
+                            .size(12.5)
+                            .color(palette::TEXT_SECONDARY),
+                        );
+                        ui.add_space(8.0);
+                        if action_button(
+                            ui,
+                            "Connect Installed AI Assistants (MCP)",
+                            ButtonVariant::Primary,
+                        )
+                        .clicked()
+                            && let (Some(home), Ok(exe)) = (dirs::home_dir(), std::env::current_exe())
+                        {
+                            let cli_bin = exe.with_file_name("mimir");
+                            let target_bin = if cli_bin.exists() { cli_bin } else { exe };
+                            match connect_detected_assistants(&home, &target_bin, false) {
+                                Ok(outcomes) => {
+                                    self.connect_report = outcomes
+                                        .into_iter()
+                                        .map(|o| format!("[{}] {} -> {}", o.status, o.name, o.path.display()))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
                                 }
+                                Err(e) => self.connect_report = format!("Error: {e}"),
                             }
-                            if !self.connect_report.is_empty() {
-                                ui.add_space(6.0);
-                                ui.monospace(&self.connect_report);
-                            }
-                        });
-                    ui.add_space(10.0);
-                    egui::Frame::new()
-                        .fill(card_bg)
-                        .stroke(egui::Stroke::new(1.0, hairline))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("LOCAL AI MODELS & UPDATES").monospace().size(11.0).color(text_muted));
-                                if ui.button("Check for Updates…").clicked() {
-                                    let tx = self.event_tx.clone();
-                                    self.update_line = "Checking GitHub Releases…".into();
-                                    std::thread::spawn(move || {
-                                        let res = check_for_updates(env!("CARGO_PKG_VERSION"));
-                                        let _ = tx.send(UiEvent::UpdateResult(res));
-                                    });
-                                }
-                            });
-                            ui.add_space(6.0);
-                            for m in model_statuses(&self.cfg) {
-                                ui.horizontal_wrapped(|ui| {
-                                    let status_str = if m.installed {
-                                        format!("Installed ({:.1} MB)", m.size_bytes as f64 / (1024.0 * 1024.0))
-                                    } else {
-                                        format!("Not installed ({})", m.expected_size_label)
-                                    };
-                                    ui.label(format!("{} — {}", m.name, status_str));
-                                    let btn_lbl = if m.installed { "Verify" } else { "Download" };
-                                    if ui.button(btn_lbl).clicked() {
-                                        let cfg_clone = self.cfg.clone();
-                                        let tx = self.event_tx.clone();
-                                        let id = m.id.clone();
-                                        self.status_line = format!("Downloading {}…", m.name);
-                                        std::thread::spawn(move || {
-                                            let msg = match id.as_str() {
-                                                "whistle" => match fetch_whistle_weights(&resolve_weights_path(&cfg_clone)) {
-                                                    Ok(p) => format!("Verified whistle.cact at {}", p.display()),
-                                                    Err(e) => format!("Fetch error: {e}"),
-                                                },
-                                                "qwen" => match fetch_qwen_model(&cfg_clone) {
-                                                    Ok((w, _)) => format!("Verified Qwen 2.5 0.5B at {}", w.display()),
-                                                    Err(e) => format!("Fetch error: {e}"),
-                                                },
-                                                "silero_vad" => match fetch_silero_vad(&cfg_clone) {
-                                                    Ok(p) => format!("Verified silero_vad.onnx at {}", p.display()),
-                                                    Err(e) => format!("Fetch error: {e}"),
-                                                },
-                                                "speaker_embed" => match fetch_speaker_embed(&cfg_clone) {
-                                                    Ok(p) => format!("Verified speaker_embed.onnx at {}", p.display()),
-                                                    Err(e) => format!("Fetch error: {e}"),
-                                                },
-                                                _ => "Unknown model".into(),
-                                            };
-                                            let _ = tx.send(UiEvent::Status(msg));
-                                        });
-                                    }
-                                    if m.installed && ui.button("Delete").clicked() {
-                                        let res = match m.id.as_str() {
-                                            "whistle" => std::fs::remove_file(resolve_weights_path(&self.cfg)).map_err(Into::into),
-                                            "qwen" => delete_qwen_model(&self.cfg),
-                                            "silero_vad" => delete_silero_vad(&self.cfg),
-                                            "speaker_embed" => delete_speaker_embed(&self.cfg),
-                                            _ => Ok(()),
-                                        };
-                                        self.status_line = match res {
-                                            Ok(()) => format!("Deleted {}", m.name),
-                                            Err(e) => format!("Delete error: {e}"),
-                                        };
-                                    }
+                        }
+                        if !self.connect_report.is_empty() {
+                            ui.add_space(8.0);
+                            egui::Frame::new()
+                                .fill(palette::VOID_BG)
+                                .stroke(egui::Stroke::new(1.0, hairline))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.monospace(&self.connect_report);
                                 });
-                            }
-                            if !self.update_line.is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(&self.update_line);
-                            }
-                        });
+                        }
+                    });
+                    ui.add_space(12.0);
+                    section_card(ui, "LOCAL AI MODELS & UPDATES", None, |ui| {
+                        if action_button(ui, "Check for Updates…", ButtonVariant::Secondary).clicked() {
+                            let tx = self.event_tx.clone();
+                            self.update_line = "Checking GitHub Releases…".into();
+                            std::thread::spawn(move || {
+                                let res = check_for_updates(env!("CARGO_PKG_VERSION"));
+                                let _ = tx.send(UiEvent::UpdateResult(res));
+                            });
+                        }
+                        ui.add_space(8.0);
+                        for m in model_statuses(&self.cfg) {
+                            egui::Frame::new()
+                                .fill(palette::VOID_BG)
+                                .stroke(egui::Stroke::new(1.0, hairline))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&m.name).strong().color(text_primary));
+                                        if m.installed {
+                                            badge_pill(
+                                                ui,
+                                                &format!("Installed · {:.1} MB", m.size_bytes as f64 / (1024.0 * 1024.0)),
+                                                palette::SUCCESS,
+                                                palette::CARD_BG,
+                                            );
+                                        } else {
+                                            badge_pill(
+                                                ui,
+                                                &format!("Not installed · {}", m.expected_size_label),
+                                                text_muted,
+                                                palette::CARD_BG,
+                                            );
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if m.installed
+                                                && action_button(ui, "Delete", ButtonVariant::Danger).clicked()
+                                            {
+                                                let res = match m.id.as_str() {
+                                                    "whistle" => std::fs::remove_file(resolve_weights_path(&self.cfg)).map_err(Into::into),
+                                                    "qwen" => delete_qwen_model(&self.cfg),
+                                                    "silero_vad" => delete_silero_vad(&self.cfg),
+                                                    "speaker_embed" => delete_speaker_embed(&self.cfg),
+                                                    _ => Ok(()),
+                                                };
+                                                self.status_line = match res {
+                                                    Ok(()) => format!("Deleted {}", m.name),
+                                                    Err(e) => format!("Delete error: {e}"),
+                                                };
+                                            }
+                                            let btn_lbl = if m.installed { "Verify" } else { "Download" };
+                                            let var = if m.installed { ButtonVariant::Secondary } else { ButtonVariant::Primary };
+                                            if action_button(ui, btn_lbl, var).clicked() {
+                                                let cfg_clone = self.cfg.clone();
+                                                let tx = self.event_tx.clone();
+                                                let id = m.id.clone();
+                                                self.status_line = format!("Downloading {}…", m.name);
+                                                std::thread::spawn(move || {
+                                                    let msg = match id.as_str() {
+                                                        "whistle" => match fetch_whistle_weights(&resolve_weights_path(&cfg_clone)) {
+                                                            Ok(p) => format!("Verified whistle.cact at {}", p.display()),
+                                                            Err(e) => format!("Fetch error: {e}"),
+                                                        },
+                                                        "qwen" => match fetch_qwen_model(&cfg_clone) {
+                                                            Ok((w, _)) => format!("Verified Qwen 2.5 0.5B at {}", w.display()),
+                                                            Err(e) => format!("Fetch error: {e}"),
+                                                        },
+                                                        "silero_vad" => match fetch_silero_vad(&cfg_clone) {
+                                                            Ok(p) => format!("Verified silero_vad.onnx at {}", p.display()),
+                                                            Err(e) => format!("Fetch error: {e}"),
+                                                        },
+                                                        "speaker_embed" => match fetch_speaker_embed(&cfg_clone) {
+                                                            Ok(p) => format!("Verified speaker_embed.onnx at {}", p.display()),
+                                                            Err(e) => format!("Fetch error: {e}"),
+                                                        },
+                                                        _ => "Unknown model".into(),
+                                                    };
+                                                    let _ = tx.send(UiEvent::Status(msg));
+                                                });
+                                            }
+                                        });
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
+                        if !self.update_line.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(&self.update_line).color(palette::TEXT_SECONDARY));
+                        }
+                    });
                 });
             }
         });
@@ -1695,29 +1843,6 @@ fn save_pcm_wav_maybe_encrypted(
     }
 }
 
-fn apply_obsidian_prism_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    let void_bg = egui::Color32::from_rgb(6, 8, 13);        // #06080D
-    let card_bg = egui::Color32::from_rgb(11, 16, 26);      // #0B101A
-    let elevated = egui::Color32::from_rgb(15, 23, 42);     // #0F172A
-    let hairline = egui::Color32::from_rgb(24, 36, 54);     // #182436
-    let cyan = egui::Color32::from_rgb(56, 189, 248);       // #38BDF8
-    let cobalt = egui::Color32::from_rgb(37, 99, 235);      // #2563EB
-
-    visuals.panel_fill = void_bg;
-    visuals.window_fill = card_bg;
-    visuals.extreme_bg_color = card_bg;
-    visuals.selection.bg_fill = cobalt;
-    visuals.selection.stroke = egui::Stroke::new(1.0, cyan);
-    visuals.widgets.noninteractive.bg_fill = card_bg;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, hairline);
-    visuals.widgets.inactive.bg_fill = elevated;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, hairline);
-    visuals.widgets.hovered.bg_fill = elevated;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, cyan);
-    visuals.widgets.active.bg_fill = cobalt;
-    ctx.set_visuals(visuals);
-}
 
 fn main() -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!(
