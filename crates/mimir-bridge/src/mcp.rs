@@ -493,8 +493,8 @@ fn handle_tool_call(store: &SessionStore, params: &Value) -> std::result::Result
             store
                 .update_session_summary(
                     session.id,
-                    template,
                     Some(summary_markdown),
+                    template,
                     action_items_json.as_deref(),
                 )
                 .map_err(|e| (-32000, e.to_string()))?;
