@@ -89,6 +89,7 @@ final class MimirController: ObservableObject {
     @Published var upcomingEvents: [MimirCalendarEvent] = []
     @Published var calendarAccessStatus = "Checking calendar…"
     @Published var calendarNeedsSettingsButton = false
+    @Published var calendarNeedsGrantButton = false
     @Published var calendarIcsUrls: [String] = []
     @Published var calendarIcsInput = ""
     @Published var searchQuery = ""
@@ -375,8 +376,6 @@ final class MimirController: ObservableObject {
     private func updateAutoDetectMonitor() {
         autoDetectTask?.cancel()
         autoDetectTask = nil
-        calendarPollTask?.cancel()
-        calendarPollTask = nil
         guard autoDetectCalls else { return }
         autoDetectTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -937,38 +936,57 @@ final class MimirController: ObservableObject {
         }
     }
 
+    func requestCalendarAccess() {
+        calendarAccessStatus = "Requesting Apple Calendar access…"
+        calendarNeedsGrantButton = false
+        NSApp.activate(ignoringOtherApps: true)
+        eventStore.requestFullAccessToEvents { [weak self] granted, _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if granted {
+                    self.calendarAccessStatus = "Apple Calendar connected"
+                    self.calendarNeedsSettingsButton = false
+                    self.calendarNeedsGrantButton = false
+                    self.reloadMergedCalendarEvents(includeEventKit: true)
+                } else {
+                    self.calendarAccessStatus = "Apple Calendar access denied (System Settings → Privacy & Security → Calendars)"
+                    self.calendarNeedsSettingsButton = true
+                    self.calendarNeedsGrantButton = false
+                    self.reloadMergedCalendarEvents(includeEventKit: false)
+                }
+            }
+        }
+    }
+
     func refreshCalendarEvents() {
         let status = EKEventStore.authorizationStatus(for: .event)
         switch status {
         case .authorized, .fullAccess:
             calendarAccessStatus = "Apple Calendar connected"
             calendarNeedsSettingsButton = false
+            calendarNeedsGrantButton = false
             reloadMergedCalendarEvents(includeEventKit: true)
         case .notDetermined:
-            calendarAccessStatus = "Requesting Apple Calendar access…"
             calendarNeedsSettingsButton = false
+            calendarNeedsGrantButton = true
             reloadMergedCalendarEvents(includeEventKit: false)
-            eventStore.requestFullAccessToEvents { [weak self] granted, _ in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    if granted {
-                        self.calendarAccessStatus = "Apple Calendar connected"
-                        self.calendarNeedsSettingsButton = false
-                        self.reloadMergedCalendarEvents(includeEventKit: true)
-                    } else {
-                        self.calendarAccessStatus = "Apple Calendar access denied (System Settings → Privacy & Security → Calendars)"
-                        self.calendarNeedsSettingsButton = true
-                        self.reloadMergedCalendarEvents(includeEventKit: false)
-                    }
+            if NSApp.isRunning {
+                requestCalendarAccess()
+            } else {
+                calendarAccessStatus = "Apple Calendar access not yet requested"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                    self?.requestCalendarAccess()
                 }
             }
         case .denied, .restricted, .writeOnly:
             calendarAccessStatus = "Apple Calendar access denied (System Settings → Privacy & Security → Calendars)"
             calendarNeedsSettingsButton = true
+            calendarNeedsGrantButton = false
             reloadMergedCalendarEvents(includeEventKit: false)
         @unknown default:
             calendarAccessStatus = "Apple Calendar unavailable"
             calendarNeedsSettingsButton = false
+            calendarNeedsGrantButton = false
             reloadMergedCalendarEvents(includeEventKit: false)
         }
     }

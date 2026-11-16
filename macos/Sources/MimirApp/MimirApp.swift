@@ -989,6 +989,12 @@ struct AssistantsTab: View {
                         controller.refreshCalendarEvents()
                     }
                     .buttonStyle(.bordered)
+                    if controller.calendarNeedsGrantButton {
+                        Button("Grant Calendar Access") {
+                            controller.requestCalendarAccess()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                     if controller.calendarNeedsSettingsButton {
                         Button("Open System Settings") {
                             controller.openCalendarPrivacySettings()

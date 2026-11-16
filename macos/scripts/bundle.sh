@@ -72,4 +72,7 @@ VERSION="${MIMIR_VERSION:-0.1.0}"
 VERSION="${VERSION#v}"
 sed -i '' "s/__MIMIR_VERSION__/${VERSION}/g" "$CONTENTS_DIR/Info.plist"
 
+echo "==> 4. Ad-hoc codesigning Mimir.app for macOS TCC permissions..."
+codesign --force --deep --sign - "$APP_DIR"
+
 echo "✓ Bundled $APP_DIR"
