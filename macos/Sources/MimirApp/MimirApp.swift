@@ -928,10 +928,7 @@ struct SessionsTab: View {
                                 .font(.system(size: 13))
                                 .foregroundStyle(MimirTheme.textMuted)
                         } else {
-                            Text(controller.selectedSummaryMarkdown)
-                                .textSelection(.enabled)
-                                .font(.system(size: 13))
-                                .foregroundStyle(MimirTheme.textPrimary)
+                            MarkdownDocumentView(markdown: controller.selectedSummaryMarkdown)
                         }
                         if !controller.selectedActionItems.isEmpty {
                             Text("ACTION ITEMS")
@@ -951,11 +948,14 @@ struct SessionsTab: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(14)
+                } else if controller.selectedTranscript.isEmpty {
+                    Text("Select a session from the left rail to inspect its transcript.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(MimirTheme.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
                 } else {
-                    Text(controller.selectedTranscript.isEmpty ? "Select a session from the left rail to inspect its transcript." : controller.selectedTranscript)
-                        .textSelection(.enabled)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(MimirTheme.textPrimary)
+                    MarkdownDocumentView(markdown: controller.selectedTranscript)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(14)
                 }
@@ -1152,5 +1152,186 @@ struct AssistantsTab: View {
             Spacer()
         }
         .padding(16)
+    }
+}
+
+private struct MarkdownDocumentView: View {
+    let markdown: String
+
+    private enum Block {
+        case heading(level: Int, text: String)
+        case bullet(text: String)
+        case numbered(prefix: String, text: String)
+        case quote(text: String)
+        case code(String)
+        case divider
+        case paragraph(String)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(parseBlocks(markdown).enumerated()), id: \.offset) { _, block in
+                render(block)
+            }
+        }
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func render(_ block: Block) -> some View {
+        switch block {
+        case let .heading(level, text):
+            inlineText(text)
+                .font(.system(size: level == 1 ? 19 : (level == 2 ? 15.5 : 13.5), weight: .bold))
+                .foregroundStyle(level <= 2 ? MimirTheme.ice : MimirTheme.textPrimary)
+                .padding(.top, level == 1 ? 2 : 6)
+        case let .bullet(text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("•")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(MimirTheme.cyan)
+                inlineText(text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(MimirTheme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.leading, 6)
+        case let .numbered(prefix, text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(prefix)
+                    .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(MimirTheme.cyan)
+                inlineText(text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(MimirTheme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.leading, 6)
+        case let .quote(text):
+            HStack(alignment: .top, spacing: 10) {
+                Rectangle()
+                    .fill(MimirTheme.cyan.opacity(0.65))
+                    .frame(width: 3)
+                inlineText(text)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(MimirTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.vertical, 2)
+        case let .code(code):
+            Text(code)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(MimirTheme.voidBg)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+        case .divider:
+            Divider().background(MimirTheme.hairline).padding(.vertical, 4)
+        case let .paragraph(text):
+            inlineText(text)
+                .font(.system(size: 13))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func inlineText(_ raw: String) -> Text {
+        if let attr = try? AttributedString(
+            markdown: raw,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace
+            )
+        ) {
+            return Text(attr)
+        }
+        return Text(raw)
+    }
+
+    private func parseBlocks(_ input: String) -> [Block] {
+        var blocks: [Block] = []
+        var inCode = false
+        var codeLines: [String] = []
+        var paraLines: [String] = []
+
+        func flushPara() {
+            if !paraLines.isEmpty {
+                blocks.append(.paragraph(paraLines.joined(separator: "\n")))
+                paraLines.removeAll()
+            }
+        }
+
+        for line in input.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                flushPara()
+                if inCode {
+                    blocks.append(.code(codeLines.joined(separator: "\n")))
+                    codeLines.removeAll()
+                    inCode = false
+                } else {
+                    inCode = true
+                }
+                continue
+            }
+            if inCode {
+                codeLines.append(line)
+                continue
+            }
+            if trimmed.isEmpty {
+                flushPara()
+                continue
+            }
+            if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                flushPara()
+                blocks.append(.divider)
+                continue
+            }
+            if let level = headingLevel(trimmed) {
+                flushPara()
+                let text = String(trimmed.dropFirst(level)).trimmingCharacters(in: .whitespaces)
+                blocks.append(.heading(level: level, text: text))
+                continue
+            }
+            if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                flushPara()
+                blocks.append(.bullet(text: String(trimmed.dropFirst(2))))
+                continue
+            }
+            if let dotIdx = trimmed.firstIndex(of: "."),
+               dotIdx != trimmed.startIndex,
+               trimmed[..<dotIdx].allSatisfy(\.isNumber),
+               trimmed.index(after: dotIdx) < trimmed.endIndex,
+               trimmed[trimmed.index(after: dotIdx)] == " "
+            {
+                flushPara()
+                let prefix = String(trimmed[...dotIdx])
+                let rest = String(trimmed[trimmed.index(dotIdx, offsetBy: 2)...])
+                blocks.append(.numbered(prefix: prefix, text: rest))
+                continue
+            }
+            if trimmed.hasPrefix("> ") || trimmed == ">" {
+                flushPara()
+                let rest = trimmed == ">" ? "" : String(trimmed.dropFirst(2))
+                blocks.append(.quote(text: rest))
+                continue
+            }
+            paraLines.append(line)
+        }
+        flushPara()
+        if inCode && !codeLines.isEmpty {
+            blocks.append(.code(codeLines.joined(separator: "\n")))
+        }
+        return blocks
+    }
+
+    private func headingLevel(_ line: String) -> Int? {
+        var count = 0
+        for ch in line {
+            if ch == "#" { count += 1 } else { break }
+        }
+        guard (1...4).contains(count), line.dropFirst(count).first == " " else { return nil }
+        return count
     }
 }

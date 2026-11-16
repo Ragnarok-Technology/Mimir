@@ -1214,7 +1214,7 @@ impl eframe::App for MimirDesktopApp {
                                 if let Some(ref summary) = self.selected_summary {
                                     ui.label(egui::RichText::new("SUMMARY").monospace().size(11.0).color(ice));
                                     ui.add_space(4.0);
-                                    ui.label(egui::RichText::new(summary).color(text_primary));
+                                    render_markdown_view(ui, summary, ice, cyan, text_primary, text_muted, hairline);
                                 } else {
                                     ui.label(egui::RichText::new("No summary generated yet — click Summarize above.").color(text_muted));
                                 }
@@ -1243,7 +1243,15 @@ impl eframe::App for MimirDesktopApp {
                             } else if self.selected_markdown.is_empty() {
                                 ui.label(egui::RichText::new("Select a session from the left rail to view its Markdown.").color(text_muted));
                             } else {
-                                ui.monospace(&self.selected_markdown);
+                                render_markdown_view(
+                                    ui,
+                                    &self.selected_markdown,
+                                    ice,
+                                    cyan,
+                                    text_primary,
+                                    text_muted,
+                                    hairline,
+                                );
                             }
                         });
                     });
@@ -1548,4 +1556,201 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(MimirDesktopApp::new(cc)))),
     )
+}
+
+fn render_markdown_view(
+    ui: &mut egui::Ui,
+    markdown: &str,
+    ice: egui::Color32,
+    cyan: egui::Color32,
+    text_primary: egui::Color32,
+    text_muted: egui::Color32,
+    hairline: egui::Color32,
+) {
+    let mut in_code = false;
+    let mut code_buf = String::new();
+    let code_bg = egui::Color32::from_rgb(6, 8, 13);
+
+    for raw_line in markdown.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("```") {
+            if in_code {
+                egui::Frame::new()
+                    .fill(code_bg)
+                    .stroke(egui::Stroke::new(1.0, hairline))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(code_buf.trim_end()).monospace().size(12.0).color(text_primary));
+                    });
+                ui.add_space(4.0);
+                code_buf.clear();
+                in_code = false;
+            } else {
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            code_buf.push_str(raw_line);
+            code_buf.push('\n');
+            continue;
+        }
+        if trimmed.is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            ui.separator();
+            continue;
+        }
+
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if (1..=4).contains(&hashes) && trimmed.chars().nth(hashes) == Some(' ') {
+            let heading_text = trimmed[hashes..].trim();
+            let size = match hashes {
+                1 => 18.5,
+                2 => 15.0,
+                _ => 13.5,
+            };
+            let color = if hashes <= 2 { ice } else { text_primary };
+            ui.add_space(if hashes == 1 { 2.0 } else { 5.0 });
+            ui.label(egui::RichText::new(heading_text).strong().size(size).color(color));
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("•").strong().color(cyan));
+                ui.label(build_inline_markdown_job(rest, 13.0, text_primary, ice, code_bg));
+            });
+            continue;
+        }
+
+        if let Some((num, rest)) = trimmed.split_once(". ")
+            && !num.is_empty()
+            && num.chars().all(|c| c.is_ascii_digit())
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!("{num}.")).monospace().strong().color(cyan));
+                ui.label(build_inline_markdown_job(rest, 13.0, text_primary, ice, code_bg));
+            });
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("> ").or_else(|| (trimmed == ">").then_some("")) {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(12, 20, 34))
+                .stroke(egui::Stroke::new(1.0, hairline))
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(10, 5))
+                .show(ui, |ui| {
+                    ui.label(build_inline_markdown_job(rest, 12.5, text_muted, ice, code_bg));
+                });
+            continue;
+        }
+
+        ui.label(build_inline_markdown_job(raw_line, 13.0, text_primary, ice, code_bg));
+    }
+
+    if in_code && !code_buf.is_empty() {
+        egui::Frame::new()
+            .fill(code_bg)
+            .stroke(egui::Stroke::new(1.0, hairline))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(code_buf.trim_end()).monospace().size(12.0).color(text_primary));
+            });
+    }
+}
+
+fn build_inline_markdown_job(
+    text: &str,
+    size: f32,
+    base_color: egui::Color32,
+    accent: egui::Color32,
+    code_bg: egui::Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let mut plain_start = 0usize;
+
+    let push_plain = |job: &mut egui::text::LayoutJob, slice: &str| {
+        if !slice.is_empty() {
+            job.append(
+                slice,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(size),
+                    color: base_color,
+                    ..Default::default()
+                },
+            );
+        }
+    };
+
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"**")
+            && let Some(end) = text[i + 2..].find("**")
+        {
+            push_plain(&mut job, &text[plain_start..i]);
+            job.append(
+                &text[i + 2..i + 2 + end],
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(size),
+                    color: egui::Color32::WHITE,
+                    ..Default::default()
+                },
+            );
+            i = i + 2 + end + 2;
+            plain_start = i;
+            continue;
+        }
+        if bytes[i] == b'`'
+            && let Some(end) = text[i + 1..].find('`')
+        {
+            push_plain(&mut job, &text[plain_start..i]);
+            job.append(
+                &text[i + 1..i + 1 + end],
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::monospace(size - 0.5),
+                    color: accent,
+                    background: code_bg,
+                    ..Default::default()
+                },
+            );
+            i = i + 1 + end + 1;
+            plain_start = i;
+            continue;
+        }
+        if bytes[i] == b'*'
+            && !bytes[i..].starts_with(b"**")
+            && let Some(end) = text[i + 1..].find('*')
+        {
+            push_plain(&mut job, &text[plain_start..i]);
+            job.append(
+                &text[i + 1..i + 1 + end],
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(size),
+                    color: base_color,
+                    italics: true,
+                    ..Default::default()
+                },
+            );
+            i = i + 1 + end + 1;
+            plain_start = i;
+            continue;
+        }
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        i += ch_len;
+    }
+    push_plain(&mut job, &text[plain_start..]);
+    job
 }
