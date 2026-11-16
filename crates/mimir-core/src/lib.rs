@@ -188,6 +188,29 @@ pub enum AudioRetention {
     ArchiveWav,
 }
 
+/// CalDAV calendar account (iCloud, Fastmail, Nextcloud, Radicale, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CalDavAccount {
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// OAuth2 calendar account (Google Calendar or Microsoft 365 / Outlook Graph).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OAuthCalendarAccount {
+    /// `"google"` or `"microsoft"`.
+    pub provider: String,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
 /// Runtime configuration for Mimir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -209,6 +232,8 @@ pub struct MimirConfig {
     pub keyword_presets: Vec<KeywordPreset>,
     pub drop_sync_enabled: bool,
     pub calendar_ics_urls: Vec<String>,
+    pub caldav_accounts: Vec<CalDavAccount>,
+    pub oauth_calendar_accounts: Vec<OAuthCalendarAccount>,
 }
 
 impl Default for MimirConfig {
@@ -234,6 +259,8 @@ impl Default for MimirConfig {
             keyword_presets: Vec::new(),
             drop_sync_enabled: false,
             calendar_ics_urls: Vec::new(),
+            caldav_accounts: Vec::new(),
+            oauth_calendar_accounts: Vec::new(),
         }
     }
 }

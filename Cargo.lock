@@ -3056,6 +3056,7 @@ dependencies = [
  "mimir-diarize",
  "mimir-store",
  "mimir-whistle",
+ "rusqlite",
  "serde",
  "serde_json",
  "ureq",

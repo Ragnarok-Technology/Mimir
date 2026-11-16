@@ -1,3 +1,4 @@
+mod calendar_apps;
 mod ui_kit;
 mod updater;
 
@@ -11,10 +12,11 @@ use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_bridge::mcp::format_live_utterance_md;
 use mimir_core::calendar::{
-    CalendarEvent, open_url_in_system_browser, parse_ics, upcoming_or_active_events,
+    CalendarEvent, CalendarSourceStatus, open_url_in_system_browser,
 };
 use mimir_core::{
-    ActionItem, AudioRetention, ChannelId, KeywordPreset, MimirConfig, Session, Utterance,
+    ActionItem, AudioRetention, CalDavAccount, ChannelId, KeywordPreset, MimirConfig,
+    OAuthCalendarAccount, Session, Utterance,
 };
 use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
 use mimir_store::cleanup::{
@@ -51,7 +53,7 @@ enum UiEvent {
     Status(String),
     CleanupProgress(usize, usize),
     CleanupDone,
-    CalendarEvents(Vec<CalendarEvent>),
+    CalendarRefreshed(calendar_apps::CalendarRefreshResult),
     SessionFinished,
     UpdateResult(UpdateStatus),
 }
@@ -92,7 +94,18 @@ struct MimirDesktopApp {
     status_line: String,
     cleanup_progress: Option<(usize, usize)>,
     calendar_events: Vec<CalendarEvent>,
+    calendar_statuses: Vec<CalendarSourceStatus>,
+    apple_calendar_status: Option<String>,
     calendar_ics_input: String,
+    caldav_name_input: String,
+    caldav_url_input: String,
+    caldav_user_input: String,
+    caldav_pass_input: String,
+    oauth_provider_input: String,
+    oauth_label_input: String,
+    oauth_token_input: String,
+    oauth_refresh_input: String,
+    oauth_client_id_input: String,
     last_calendar_poll: std::time::Instant,
     last_store_poll: std::time::Instant,
     last_db_stamp: Option<std::time::SystemTime>,
@@ -149,7 +162,18 @@ impl MimirDesktopApp {
             status_line: "Ready — 100% Local • Whistle AI • Zero Telemetry".to_string(),
             cleanup_progress: None,
             calendar_events: Vec::new(),
+            calendar_statuses: Vec::new(),
+            apple_calendar_status: None,
             calendar_ics_input: String::new(),
+            caldav_name_input: String::new(),
+            caldav_url_input: String::new(),
+            caldav_user_input: String::new(),
+            caldav_pass_input: String::new(),
+            oauth_provider_input: "google".to_string(),
+            oauth_label_input: String::new(),
+            oauth_token_input: String::new(),
+            oauth_refresh_input: String::new(),
+            oauth_client_id_input: String::new(),
             last_calendar_poll: std::time::Instant::now(),
             last_store_poll: std::time::Instant::now(),
             last_db_stamp: initial_db_stamp,
@@ -548,32 +572,15 @@ impl MimirDesktopApp {
     }
 
     fn refresh_calendar_events(&self) {
-        let sources = self.cfg.calendar_ics_urls.clone();
-        if sources.is_empty() {
-            return;
-        }
+        self.refresh_calendar_events_with_prompt(false);
+    }
+
+    fn refresh_calendar_events_with_prompt(&self, request_macos_access: bool) {
+        let cfg = self.cfg.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let mut all = Vec::new();
-            for src in sources {
-                let trimmed = src.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let content = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                    ureq::get(trimmed)
-                        .call()
-                        .ok()
-                        .and_then(|mut r| r.body_mut().read_to_string().ok())
-                } else {
-                    std::fs::read_to_string(trimmed).ok()
-                };
-                if let Some(ics) = content {
-                    all.extend(parse_ics(&ics, trimmed));
-                }
-            }
-            let upcoming = upcoming_or_active_events(&all, Utc::now().timestamp(), 900);
-            let _ = tx.send(UiEvent::CalendarEvents(upcoming));
+            let res = calendar_apps::fetch_all_calendar_events(&cfg, request_macos_access);
+            let _ = tx.send(UiEvent::CalendarRefreshed(res));
         });
     }
 
@@ -650,8 +657,14 @@ impl MimirDesktopApp {
                         self.load_session(sid);
                     }
                 }
-                UiEvent::CalendarEvents(events) => {
-                    self.calendar_events = events;
+                UiEvent::CalendarRefreshed(res) => {
+                    self.calendar_events = res.events;
+                    self.calendar_statuses = res.statuses;
+                    self.apple_calendar_status = res.apple_status;
+                    if let Some(updated_oauth) = res.updated_oauth_accounts {
+                        self.cfg.oauth_calendar_accounts = updated_oauth;
+                        let _ = self.cfg.save();
+                    }
                 }
                 UiEvent::SessionFinished => {
                     self.is_recording = false;
@@ -706,9 +719,7 @@ impl eframe::App for MimirDesktopApp {
                     }
                 }
             }
-            if !self.cfg.calendar_ics_urls.is_empty()
-                && self.last_calendar_poll.elapsed() >= std::time::Duration::from_secs(60)
-            {
+            if self.last_calendar_poll.elapsed() >= std::time::Duration::from_secs(60) {
                 self.last_calendar_poll = std::time::Instant::now();
                 self.refresh_calendar_events();
             }
@@ -960,6 +971,19 @@ impl eframe::App for MimirDesktopApp {
                                 ui.set_min_width(ui.available_width());
                                 ui.horizontal_wrapped(|ui| {
                                     badge_pill(ui, "UPCOMING", ice, palette::VOID_BG);
+                                    let src_badge = match ev.source.as_str() {
+                                        "apple_calendar" => "APPLE CALENDAR",
+                                        "outlook" => "OUTLOOK",
+                                        "windows_calendar" => "WINDOWS CALENDAR",
+                                        "gnome_evolution" => "GNOME CALENDAR",
+                                        "kde_korganizer" => "KDE KORGANIZER",
+                                        "thunderbird" => "THUNDERBIRD",
+                                        s if s.starts_with("caldav:") => "CALDAV",
+                                        s if s.starts_with("google:") => "GOOGLE",
+                                        s if s.starts_with("microsoft:") => "MICROSOFT 365",
+                                        _ => "ICS",
+                                    };
+                                    badge_pill(ui, src_badge, hairline, ice);
                                     ui.label(egui::RichText::new(&ev.title).strong().size(13.5).color(text_primary));
                                     ui.label(egui::RichText::new(format!("· {timing} · {} attendee(s)", ev.attendees.len())).color(palette::TEXT_SECONDARY));
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1575,7 +1599,228 @@ impl eframe::App for MimirDesktopApp {
                         }
                     });
                     ui.add_space(12.0);
-                    section_card(ui, "CALENDAR (ICS)", None, |ui| {
+                    section_card(ui, "CALENDAR APPS & FEEDS", None, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Integrates with Apple Calendar, Outlook, Windows Calendar, GNOME/Evolution, KDE KOrganizer, Thunderbird, CalDAV, Google/Microsoft 365, and .ics feeds.",
+                                )
+                                .size(12.0)
+                                .color(palette::TEXT_SECONDARY),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if action_button(ui, "Refresh All", ButtonVariant::Secondary).clicked() {
+                                    self.refresh_calendar_events();
+                                }
+                                #[cfg(target_os = "macos")]
+                                {
+                                    if matches!(self.apple_calendar_status.as_deref(), Some("not_determined"))
+                                        && action_button(ui, "Grant Apple Calendar Access", ButtonVariant::Primary).clicked()
+                                    {
+                                        self.refresh_calendar_events_with_prompt(true);
+                                    } else if matches!(
+                                        self.apple_calendar_status.as_deref(),
+                                        Some("denied") | Some("restricted") | Some("write_only")
+                                    ) && action_button(ui, "Open Privacy Settings", ButtonVariant::Secondary).clicked()
+                                    {
+                                        let _ = open_url_in_system_browser(
+                                            "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
+                                        );
+                                    }
+                                }
+                            });
+                        });
+                        if !self.calendar_statuses.is_empty() {
+                            ui.add_space(8.0);
+                            for st in &self.calendar_statuses {
+                                egui::Frame::new()
+                                    .fill(palette::VOID_BG)
+                                    .stroke(egui::Stroke::new(1.0, hairline))
+                                    .corner_radius(egui::CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(&st.name).strong().color(text_primary));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let badge_bg = if st.status.starts_with("Connected") {
+                                                    active_bg
+                                                } else {
+                                                    hairline
+                                                };
+                                                let badge_fg = if st.status.starts_with("Connected") {
+                                                    ice
+                                                } else {
+                                                    palette::TEXT_SECONDARY
+                                                };
+                                                badge_pill(
+                                                    ui,
+                                                    &format!("{} · {} upcoming", st.status, st.event_count),
+                                                    badge_bg,
+                                                    badge_fg,
+                                                );
+                                            });
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("CalDAV Accounts (iCloud, Fastmail, Nextcloud, Radicale)")
+                                .strong()
+                                .size(12.5)
+                                .color(text_primary),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            styled_text_input(ui, &mut self.caldav_name_input, "Label (e.g. iCloud)", Some(130.0));
+                            styled_text_input(ui, &mut self.caldav_url_input, "https://caldav.example.com/...", Some(220.0));
+                            styled_text_input(ui, &mut self.caldav_user_input, "Username", Some(130.0));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.caldav_pass_input)
+                                    .password(true)
+                                    .hint_text("App Password")
+                                    .desired_width(130.0),
+                            );
+                            if action_button(ui, "Add CalDAV", ButtonVariant::Primary).clicked() {
+                                let url = self.caldav_url_input.trim().to_string();
+                                if !url.is_empty() {
+                                    self.cfg.caldav_accounts.push(CalDavAccount {
+                                        name: self.caldav_name_input.trim().to_string(),
+                                        url,
+                                        username: self.caldav_user_input.trim().to_string(),
+                                        password: self.caldav_pass_input.clone(),
+                                    });
+                                    self.caldav_name_input.clear();
+                                    self.caldav_url_input.clear();
+                                    self.caldav_user_input.clear();
+                                    self.caldav_pass_input.clear();
+                                    let _ = self.cfg.save();
+                                    self.refresh_calendar_events();
+                                }
+                            }
+                        });
+                        if !self.cfg.caldav_accounts.is_empty() {
+                            ui.add_space(6.0);
+                            let mut remove_caldav = None;
+                            for (idx, acc) in self.cfg.caldav_accounts.iter().enumerate() {
+                                egui::Frame::new()
+                                    .fill(palette::VOID_BG)
+                                    .stroke(egui::Stroke::new(1.0, hairline))
+                                    .corner_radius(egui::CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.monospace(format!("{} ({}) — {}", acc.name, acc.username, acc.url));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if action_button(ui, "Remove", ButtonVariant::Danger).clicked() {
+                                                    remove_caldav = Some(idx);
+                                                }
+                                            });
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                            if let Some(idx) = remove_caldav {
+                                self.cfg.caldav_accounts.remove(idx);
+                                let _ = self.cfg.save();
+                                self.refresh_calendar_events();
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("Google Calendar & Microsoft 365 / Outlook (OAuth2)")
+                                .strong()
+                                .size(12.5)
+                                .color(text_primary),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if pill_tab(ui, "Google", self.oauth_provider_input == "google").clicked() {
+                                self.oauth_provider_input = "google".to_string();
+                            }
+                            if pill_tab(ui, "Microsoft 365", self.oauth_provider_input == "microsoft").clicked() {
+                                self.oauth_provider_input = "microsoft".to_string();
+                            }
+                            styled_text_input(ui, &mut self.oauth_label_input, "Label (e.g. Work)", Some(120.0));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.oauth_token_input)
+                                    .password(true)
+                                    .hint_text("Access Token")
+                                    .desired_width(160.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.oauth_refresh_input)
+                                    .password(true)
+                                    .hint_text("Refresh Token (opt)")
+                                    .desired_width(140.0),
+                            );
+                            styled_text_input(ui, &mut self.oauth_client_id_input, "Client ID (opt)", Some(130.0));
+                            if action_button(ui, "Add OAuth", ButtonVariant::Primary).clicked() {
+                                let token = self.oauth_token_input.trim().to_string();
+                                let refresh = self.oauth_refresh_input.trim().to_string();
+                                if !token.is_empty() || !refresh.is_empty() {
+                                    self.cfg.oauth_calendar_accounts.push(OAuthCalendarAccount {
+                                        provider: self.oauth_provider_input.clone(),
+                                        label: self.oauth_label_input.trim().to_string(),
+                                        access_token: token,
+                                        refresh_token: if refresh.is_empty() { None } else { Some(refresh) },
+                                        client_id: {
+                                            let cid = self.oauth_client_id_input.trim().to_string();
+                                            if cid.is_empty() { None } else { Some(cid) }
+                                        },
+                                        expires_at: None,
+                                    });
+                                    self.oauth_label_input.clear();
+                                    self.oauth_token_input.clear();
+                                    self.oauth_refresh_input.clear();
+                                    self.oauth_client_id_input.clear();
+                                    let _ = self.cfg.save();
+                                    self.refresh_calendar_events();
+                                }
+                            }
+                        });
+                        if !self.cfg.oauth_calendar_accounts.is_empty() {
+                            ui.add_space(6.0);
+                            let mut remove_oauth = None;
+                            for (idx, acc) in self.cfg.oauth_calendar_accounts.iter().enumerate() {
+                                egui::Frame::new()
+                                    .fill(palette::VOID_BG)
+                                    .stroke(egui::Stroke::new(1.0, hairline))
+                                    .corner_radius(egui::CornerRadius::same(7))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.monospace(format!("{}: {}", acc.provider, acc.label));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if action_button(ui, "Remove", ButtonVariant::Danger).clicked() {
+                                                    remove_oauth = Some(idx);
+                                                }
+                                            });
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                            if let Some(idx) = remove_oauth {
+                                self.cfg.oauth_calendar_accounts.remove(idx);
+                                let _ = self.cfg.save();
+                                self.refresh_calendar_events();
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(".ics Feeds & Local Files")
+                                .strong()
+                                .size(12.5)
+                                .color(text_primary),
+                        );
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             styled_text_input(
                                 ui,
@@ -1591,9 +1836,6 @@ impl eframe::App for MimirDesktopApp {
                                     let _ = self.cfg.save();
                                     self.refresh_calendar_events();
                                 }
-                            }
-                            if action_button(ui, "Refresh", ButtonVariant::Secondary).clicked() {
-                                self.refresh_calendar_events();
                             }
                         });
                         if !self.cfg.calendar_ics_urls.is_empty() {

@@ -15,7 +15,9 @@ echo "==> 1. Building Rust mimir & mimir-desktop (release)..."
 echo "==> 2. Building macOS ScreenCaptureKit helper mimir-sc-tap (release)..."
 "$MACOS_DIR/scripts/build.sh" -c release
 
-TAP_BIN="$(cd "$MACOS_DIR" && "$MACOS_DIR/scripts/build.sh" -c release --show-bin-path)/mimir-sc-tap"
+BIN_DIR="$(cd "$MACOS_DIR" && "$MACOS_DIR/scripts/build.sh" -c release --show-bin-path)"
+TAP_BIN="$BIN_DIR/mimir-sc-tap"
+CAL_BIN="$BIN_DIR/mimir-calendar"
 UI_BIN="$ROOT_DIR/target/release/mimir-desktop"
 RUST_BIN="$ROOT_DIR/target/release/mimir"
 
@@ -26,7 +28,8 @@ mkdir -p "$MACOS_BIN_DIR" "$RESOURCES_DIR"
 cp "$UI_BIN" "$MACOS_BIN_DIR/Mimir"
 cp "$RUST_BIN" "$MACOS_BIN_DIR/mimir-cli"
 cp "$TAP_BIN" "$MACOS_BIN_DIR/mimir-sc-tap"
-chmod +x "$MACOS_BIN_DIR/Mimir" "$MACOS_BIN_DIR/mimir-cli" "$MACOS_BIN_DIR/mimir-sc-tap"
+cp "$CAL_BIN" "$MACOS_BIN_DIR/mimir-calendar"
+chmod +x "$MACOS_BIN_DIR/Mimir" "$MACOS_BIN_DIR/mimir-cli" "$MACOS_BIN_DIR/mimir-sc-tap" "$MACOS_BIN_DIR/mimir-calendar"
 if [ -f "$MACOS_DIR/Resources/AppIcon.icns" ]; then
     cp "$MACOS_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 fi
