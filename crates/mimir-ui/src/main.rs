@@ -316,7 +316,7 @@ impl MimirDesktopApp {
                 let (audio_tx, audio_rx) = mpsc::channel();
                 #[cfg(target_os = "macos")]
                 let mut sc_tap_child: Option<std::process::Child> = if cfg.capture_system_audio {
-                    spawn_macos_sc_tap(audio_tx.clone(), stop_flag.clone())
+                    spawn_macos_sc_tap(audio_tx.clone(), stop.clone())
                 } else {
                     None
                 };
