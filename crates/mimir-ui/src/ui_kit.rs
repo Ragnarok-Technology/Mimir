@@ -1,5 +1,5 @@
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Margin, Pos2, Rect,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Margin, Pos2,
     Response, Sense, Stroke, TextStyle, Vec2,
 };
 
@@ -361,6 +361,7 @@ pub fn toggle_switch(
 
 pub fn session_card_row(
     ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
     title: &str,
     meta: &str,
     has_summary: bool,

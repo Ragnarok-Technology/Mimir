@@ -26,6 +26,8 @@ pub struct SessionSummary {
     pub utterance_count: usize,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub has_summary: bool,
 }
 
 /// Full-text search hit across stored sessions.
@@ -361,14 +363,16 @@ impl SessionStore {
         include_archived: bool,
     ) -> Result<Vec<SessionSummary>> {
         let sql = if include_archived {
-            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived
+            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived,
+                    (s.summary_markdown IS NOT NULL AND TRIM(s.summary_markdown) != '') as has_sum
              FROM sessions s
              LEFT JOIN utterances u ON u.session_id = s.id
              GROUP BY s.id
              ORDER BY s.started_at DESC
              LIMIT ?1"
         } else {
-            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived
+            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived,
+                    (s.summary_markdown IS NOT NULL AND TRIM(s.summary_markdown) != '') as has_sum
              FROM sessions s
              LEFT JOIN utterances u ON u.session_id = s.id
              WHERE s.archived = 0
@@ -389,13 +393,14 @@ impl SessionStore {
                 let ended_str: Option<String> = row.get(3)?;
                 let count: i64 = row.get(4)?;
                 let archived: i64 = row.get(5)?;
-                Ok((id_str, title, started_str, ended_str, count, archived != 0))
+                let has_summary: i64 = row.get(6)?;
+                Ok((id_str, title, started_str, ended_str, count, archived != 0, has_summary != 0))
             })
             .map_err(|e| MimirError::Storage(e.to_string()))?;
 
         let mut out = Vec::new();
         for r in rows {
-            let (id_str, title, started_str, ended_str, count, archived) =
+            let (id_str, title, started_str, ended_str, count, archived, has_summary) =
                 r.map_err(|e| MimirError::Storage(e.to_string()))?;
             out.push(SessionSummary {
                 id: Uuid::parse_str(&id_str)
@@ -410,6 +415,7 @@ impl SessionStore {
                     .map_err(|e| MimirError::Storage(e.to_string()))?,
                 utterance_count: count.max(0) as usize,
                 archived,
+                has_summary,
             });
         }
         Ok(out)
