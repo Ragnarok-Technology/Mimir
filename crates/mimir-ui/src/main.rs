@@ -298,11 +298,12 @@ impl MimirDesktopApp {
         let tx_ui = self.event_tx.clone();
         let cal_meta = self.pending_calendar_meta.take();
 
+        let kws_for_opts = keywords.clone();
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let engine = WhistleEngine::load(&lib_path, &weights_path)?;
-                let store = SessionStore::open(&cfg.data_dir)?;
-                let mut session = Session::new(title, keywords.clone());
+                let store = SessionStore::open_with_encryption(&cfg.data_dir, encrypt_at_rest)?;
+                let mut session = Session::new(title, kws_for_opts.clone());
                 if let Some((uid, url, attendees)) = cal_meta {
                     session.calendar_event_uid = Some(uid);
                     session.meeting_url = url;
@@ -313,6 +314,12 @@ impl MimirDesktopApp {
                 store.create_session(&session)?;
 
                 let (audio_tx, audio_rx) = mpsc::channel();
+                #[cfg(target_os = "macos")]
+                let mut sc_tap_child: Option<std::process::Child> = if cfg.capture_system_audio {
+                    spawn_macos_sc_tap(audio_tx.clone(), stop_flag.clone())
+                } else {
+                    None
+                };
                 let mut capture = start_dual_capture(audio_tx)?;
 
                 let mut bleed_gate = BleedGate::default_20ms();
@@ -439,6 +446,11 @@ impl MimirDesktopApp {
                 }
 
                 drop(capture);
+                #[cfg(target_os = "macos")]
+                if let Some(mut child) = sc_tap_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
                 mic_level.store(0.0f32.to_bits(), Ordering::Relaxed);
                 sys_level.store(0.0f32.to_bits(), Ordering::Relaxed);
                 if save_wav {
@@ -468,6 +480,41 @@ impl MimirDesktopApp {
                     Utc::now(),
                     &langs.into_iter().collect::<Vec<_>>(),
                 );
+                if cfg.cleanup_enabled {
+                    let _ = tx_ui.send(UiEvent::Status("Cleaning up transcript…".into()));
+                    let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg);
+                    let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                        QwenCleanupModel::load(&qwen_w, &qwen_t).ok()
+                    } else {
+                        None
+                    };
+                    let _ = store.cleanup_session_with_context_and_progress(
+                        session.id,
+                        |utt, prev, next| {
+                            let src = utt.raw_text.as_deref().unwrap_or(&utt.text);
+                            let base = basic_heuristic_cleanup(src, &kws_for_opts);
+                            let cleaned = if let Some(q) = qwen.as_mut() {
+                                let (sys, usr) = build_qwen_cleanup_prompt_with_context(
+                                    prev,
+                                    &base,
+                                    next,
+                                    &kws_for_opts,
+                                );
+                                match q.complete(&sys, &usr, 128) {
+                                    Ok(cand) => sanitize_cleanup_edit(&base, &cand),
+                                    Err(_) => base,
+                                }
+                            } else {
+                                base
+                            };
+                            Ok(Some(cleaned))
+                        },
+                        |done, total| {
+                            let _ = tx_ui.send(UiEvent::CleanupProgress(done, total));
+                        },
+                    );
+                    let _ = tx_ui.send(UiEvent::CleanupDone);
+                }
                 let _ = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg);
                 Ok(())
             })();
@@ -1161,6 +1208,18 @@ impl eframe::App for MimirDesktopApp {
                             if ui
                                 .add_enabled(
                                     !self.is_recording,
+                                    egui::Checkbox::new(
+                                        &mut self.cfg.capture_system_audio,
+                                        "Capture system audio",
+                                    ),
+                                )
+                                .changed()
+                            {
+                                let _ = self.cfg.save();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.is_recording,
                                     egui::Checkbox::new(&mut self.diarize_mic, "Multi-speaker mic diarization"),
                                 )
                                 .changed()
@@ -1185,12 +1244,35 @@ impl eframe::App for MimirDesktopApp {
                             if ui
                                 .add_enabled(
                                     !self.is_recording,
-                                    egui::Checkbox::new(&mut self.encrypt_at_rest, "Encrypt transcripts & audio at rest"),
+                                    egui::Checkbox::new(
+                                        &mut self.cfg.cleanup_enabled,
+                                        "Post-process transcript cleanup on stop",
+                                    ),
+                                )
+                                .changed()
+                            {
+                                let _ = self.cfg.save();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.is_recording,
+                                    egui::Checkbox::new(
+                                        &mut self.encrypt_at_rest,
+                                        "Encrypt transcripts, search index, WAL & audio at rest",
+                                    ),
                                 )
                                 .changed()
                             {
                                 self.cfg.encrypt_at_rest = self.encrypt_at_rest;
                                 let _ = self.cfg.save();
+                                if self.encrypt_at_rest
+                                    && let Ok(store) = SessionStore::open_with_encryption(&self.cfg.data_dir, true)
+                                    && let Ok(count) = store.encrypt_existing_data()
+                                {
+                                    self.status_line = format!(
+                                        "At-rest encryption enabled ({count} existing record(s) encrypted)."
+                                    );
+                                }
                             }
                             if ui
                                 .checkbox(
@@ -1777,3 +1859,65 @@ fn build_inline_markdown_job(
     push_plain(&mut job, &text[plain_start..]);
     job
 }
+
+#[cfg(target_os = "macos")]
+fn spawn_macos_sc_tap(
+    tx: mpsc::Sender<mimir_audio::CapturedFrame>,
+    stop_flag: Arc<AtomicBool>,
+) -> Option<std::process::Child> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let tap_bin = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("mimir-sc-tap")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("mimir-sc-tap"));
+
+    let mut child = Command::new(tap_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return None;
+    };
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut rem: Vec<u8> = Vec::new();
+        while !stop_flag.load(Ordering::Relaxed) {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    rem.extend_from_slice(&buf[..n]);
+                    let full_bytes = (rem.len() / 4) * 4;
+                    if full_bytes > 0 {
+                        let mut samples = Vec::with_capacity(full_bytes / 4);
+                        for chunk in rem[..full_bytes].chunks_exact(4) {
+                            samples.push(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ]));
+                        }
+                        rem.drain(..full_bytes);
+                        if tx
+                            .send(mimir_audio::CapturedFrame {
+                                channel: ChannelId::System,
+                                samples,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Some(child)
+}
+

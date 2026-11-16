@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 chacha20poly1305.workspace = true
 chrono.workspace = true
+hex.workspace = true
 sha2.workspace = true
 mimir-core = { path = "../mimir-core" }
 rusqlite.workspace = true
