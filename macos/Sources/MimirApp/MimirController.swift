@@ -88,6 +88,9 @@ final class MimirController: ObservableObject {
     @Published var summarizeTotal = 0
     @Published var upcomingEvents: [MimirCalendarEvent] = []
     @Published var calendarAccessStatus = "Checking calendar…"
+    @Published var calendarNeedsSettingsButton = false
+    @Published var calendarIcsUrls: [String] = []
+    @Published var calendarIcsInput = ""
     @Published var searchQuery = ""
     @Published var searchResults: [MimirSearchHit] = []
     @Published var speakerIdEdit = ""
@@ -117,6 +120,7 @@ final class MimirController: ObservableObject {
     private var globalKeyMonitor: Any?
     private var terminationObserver: NSObjectProtocol?
     private var autoDetectTask: Task<Void, Never>?
+    private var calendarPollTask: Task<Void, Never>?
     private var wasAudioActiveBeforeStop = false
     private let eventStore = EKEventStore()
     private var pendingCalendarEvent: MimirCalendarEvent?
@@ -333,6 +337,8 @@ final class MimirController: ObservableObject {
     func shutdownSync() {
         autoDetectTask?.cancel()
         autoDetectTask = nil
+        calendarPollTask?.cancel()
+        calendarPollTask = nil
         try? stdinPipe?.fileHandleForWriting.close()
         stdinPipe = nil
         let tap = systemTap
@@ -369,6 +375,8 @@ final class MimirController: ObservableObject {
     private func updateAutoDetectMonitor() {
         autoDetectTask?.cancel()
         autoDetectTask = nil
+        calendarPollTask?.cancel()
+        calendarPollTask = nil
         guard autoDetectCalls else { return }
         autoDetectTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -1203,7 +1211,7 @@ final class MimirController: ObservableObject {
         startRecording()
     }
 
-    private static func extractMeetingURL(from text: String) -> URL? {
+    nonisolated private static func extractMeetingURL(from text: String) -> URL? {
         let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "<>\"'()"))
         for token in text.components(separatedBy: separators) {
             let cleaned = token.trimmingCharacters(in: CharacterSet(charactersIn: ",.;\\"))

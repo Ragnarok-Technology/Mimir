@@ -141,6 +141,7 @@ impl MimirDesktopApp {
             summarize_progress: None,
             calendar_events: Vec::new(),
             calendar_ics_input: String::new(),
+            last_calendar_poll: std::time::Instant::now(),
             pending_calendar_meta: None,
             connect_report: String::new(),
             update_line: String::new(),

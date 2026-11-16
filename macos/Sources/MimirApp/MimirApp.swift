@@ -1005,7 +1005,7 @@ struct AssistantsTab: View {
                         .font(.system(size: 12))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
-                        .background(MimirTheme.panelBg)
+                        .background(MimirTheme.elevatedBg)
                         .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
                         .onSubmit {
                             controller.addCalendarIcsSource()
