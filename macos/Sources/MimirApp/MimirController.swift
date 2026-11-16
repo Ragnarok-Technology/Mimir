@@ -1,9 +1,10 @@
 import AppKit
 import CoreAudio
+import EventKit
 import Foundation
 import MimirCore
 
-struct MimirSearchHit: Identifiable, Decodable {
+struct MimirSearchHit: Identifiable, Decodable, Sendable {
     let utterance_id: String
     let session_id: String
     let session_title: String?
@@ -14,11 +15,52 @@ struct MimirSearchHit: Identifiable, Decodable {
     var id: String { utterance_id }
 }
 
+struct MimirModelStatus: Identifiable, Decodable, Sendable {
+    let id: String
+    let name: String
+    let installed: Bool
+    let size_bytes: UInt64
+    let expected_size_label: String
+    let path: String
+}
+
+struct MimirKeywordPreset: Identifiable, Codable, Hashable, Sendable {
+    let name: String
+    let keywords: [String]
+    var id: String { name }
+}
+
+struct MimirActionItem: Identifiable, Decodable, Sendable {
+    let owner: String?
+    let task: String
+    let due_hint: String?
+    let timestamp: String?
+    var id: String { "\(owner ?? "")|\(task)|\(timestamp ?? "")" }
+}
+
+struct MimirSessionJson: Decodable, Sendable {
+    let summary_markdown: String?
+    let summary_template: String?
+    let action_items_json: String?
+}
+
+struct MimirCalendarEvent: Identifiable, Sendable {
+    let uid: String
+    let title: String
+    let startDate: Date
+    let endDate: Date
+    let meetingUrl: URL?
+    let attendees: [String]
+    let notes: String?
+    var id: String { uid }
+}
+
 @MainActor
 final class MimirController: ObservableObject {
     @Published var isRecording = false
     @Published var diarizeMic = false
     @Published var saveWav = false
+    @Published var enableCleanup = false
     @Published var autoDetectCalls = false {
         didSet { updateAutoDetectMonitor() }
     }
@@ -27,12 +69,25 @@ final class MimirController: ObservableObject {
     @Published var sysActivity: Double = 0
     @Published var sessionTitle = ""
     @Published var keywordsText = ""
+    @Published var keywordPresets: [MimirKeywordPreset] = []
+    @Published var selectedPresetName = ""
+    @Published var presetNameInput = ""
+    @Published var autoSummarize = true
+    @Published var dropSyncEnabled = false
     @Published var liveLines: [String] = []
     @Published var sessions: [MimirSessionSummary] = []
     @Published var showArchived = false
     @Published var selectedSessionId: String?
     @Published var selectedTranscript = ""
     @Published var selectedTitleEdit = ""
+    @Published var selectedSummaryMarkdown = ""
+    @Published var selectedSummaryTemplate = "general"
+    @Published var selectedActionItems: [MimirActionItem] = []
+    @Published var isSummarizingSession = false
+    @Published var summarizeDone = 0
+    @Published var summarizeTotal = 0
+    @Published var upcomingEvents: [MimirCalendarEvent] = []
+    @Published var calendarAccessStatus = "Checking calendar…"
     @Published var searchQuery = ""
     @Published var searchResults: [MimirSearchHit] = []
     @Published var speakerIdEdit = ""
@@ -41,6 +96,18 @@ final class MimirController: ObservableObject {
     @Published var connectReport = ""
     @Published var updateMessage = ""
     @Published var updateDownloadURL: URL?
+    @Published var modelStatuses: [MimirModelStatus] = []
+    @Published var activeModelTaskId: String?
+    @Published var isCleaningSession = false
+    @Published var cleanupDone = 0
+    @Published var cleanupTotal = 0
+    @Published var transcriptViewMode = "cleaned" {
+        didSet {
+            if transcriptViewMode != "summary", let sid = selectedSessionId {
+                selectSession(sid)
+            }
+        }
+    }
 
     private var recordProcess: Process?
     private var stdinPipe: Pipe?
@@ -48,8 +115,11 @@ final class MimirController: ObservableObject {
     private var liveStdoutBuffer = ""
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
+    private var terminationObserver: NSObjectProtocol?
     private var autoDetectTask: Task<Void, Never>?
     private var wasAudioActiveBeforeStop = false
+    private let eventStore = EKEventStore()
+    private var pendingCalendarEvent: MimirCalendarEvent?
 
     /// Resolves the `mimir` CLI binary: prefers bundled `Contents/MacOS/mimir-cli` inside `.app`,
     /// falling back to repo `target/release/mimir` during development.
@@ -68,8 +138,20 @@ final class MimirController: ObservableObject {
     }
 
     init() {
+        loadConfigFlags()
         refreshSessions()
+        refreshPresets()
+        refreshCalendarEvents()
         installHotkeys()
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.shutdownSync()
+            }
+        }
     }
 
     private func installHotkeys() {
@@ -119,8 +201,21 @@ final class MimirController: ObservableObject {
         if saveWav {
             args.append("--save-wav")
         }
+        if enableCleanup {
+            args.append("--cleanup")
+        }
         for kw in keywordsText.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !kw.isEmpty {
             args += ["--keyword", kw]
+        }
+        if let calEv = pendingCalendarEvent {
+            args += ["--calendar-uid", calEv.uid]
+            if let url = calEv.meetingUrl {
+                args += ["--meeting-url", url.absoluteString]
+            }
+            for att in calEv.attendees where !att.trimmingCharacters(in: .whitespaces).isEmpty {
+                args += ["--attendee", att]
+            }
+            pendingCalendarEvent = nil
         }
         if captureSystemAudio {
             args.append("--system-pcm-stdin")
@@ -210,19 +305,64 @@ final class MimirController: ObservableObject {
     }
 
     func stopRecording() {
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        let tap = systemTap
+        systemTap = nil
         Task {
-            await systemTap?.stop()
-            systemTap = nil
-            try? stdinPipe?.fileHandleForWriting.close()
-            stdinPipe = nil
+            await tap?.stop()
         }
         if let proc = recordProcess, proc.isRunning {
-            kill(proc.processIdentifier, SIGINT)
+            let pid = proc.processIdentifier
+            kill(pid, SIGINT)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0) {
+                if proc.isRunning {
+                    kill(pid, SIGTERM)
+                }
+            }
         }
         micActivity = 0
         sysActivity = 0
         wasAudioActiveBeforeStop = true
         statusMessage = "Finalizing transcript…"
+    }
+
+    /// Synchronously stops capture and waits briefly for `mimir-cli` to release
+    /// the microphone and flush SQLite before the app terminates.
+    func shutdownSync() {
+        autoDetectTask?.cancel()
+        autoDetectTask = nil
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        let tap = systemTap
+        systemTap = nil
+        if let tap {
+            Task {
+                await tap.stop()
+            }
+        }
+        if let proc = recordProcess, proc.isRunning {
+            let pid = proc.processIdentifier
+            kill(pid, SIGINT)
+            let deadline = Date().addingTimeInterval(1.5)
+            while proc.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if proc.isRunning {
+                proc.terminate()
+                let termDeadline = Date().addingTimeInterval(0.5)
+                while proc.isRunning && Date() < termDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            if proc.isRunning {
+                kill(pid, SIGKILL)
+            }
+        }
+        recordProcess = nil
+        isRecording = false
+        micActivity = 0
+        sysActivity = 0
     }
 
     private func updateAutoDetectMonitor() {
@@ -364,9 +504,27 @@ final class MimirController: ObservableObject {
         if let match = sessions.first(where: { $0.id == id }) {
             selectedTitleEdit = match.title == "Untitled" ? "" : match.title
         }
+        let viewMode = transcriptViewMode == "summary" ? "cleaned" : transcriptViewMode
         Task {
-            let md = await runCli(["export", id, "--format", "md"])
+            let md = await runCli(["export", id, "--format", "md", "--view", viewMode])
             self.selectedTranscript = md
+            let jsonOut = await runCli(["export", id, "--format", "json"])
+            if let data = jsonOut.data(using: .utf8),
+               let detail = try? JSONDecoder().decode(MimirSessionJson.self, from: data)
+            {
+                self.selectedSummaryMarkdown = detail.summary_markdown ?? ""
+                if let tmpl = detail.summary_template, !tmpl.isEmpty {
+                    self.selectedSummaryTemplate = tmpl
+                }
+                if let rawItems = detail.action_items_json,
+                   let itemsData = rawItems.data(using: .utf8),
+                   let decodedItems = try? JSONDecoder().decode([MimirActionItem].self, from: itemsData)
+                {
+                    self.selectedActionItems = decodedItems
+                } else {
+                    self.selectedActionItems = []
+                }
+            }
         }
     }
 
@@ -436,11 +594,117 @@ final class MimirController: ObservableObject {
         }
     }
 
-    func fetchModel() {
-        statusMessage = "Fetching whistle.cact (16.9 MB)…"
+    func refreshModelStatuses() {
         Task {
-            let output = await runCli(["fetch"])
-            self.statusMessage = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let output = await runCli(["models", "status", "--json"])
+            if let data = output.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([MimirModelStatus].self, from: data)
+            {
+                self.modelStatuses = decoded
+            }
+        }
+    }
+
+    func fetchModel(_ id: String = "whistle") {
+        activeModelTaskId = id
+        let flag: [String]
+        switch id {
+        case "qwen":
+            statusMessage = "Downloading Qwen 2.5 0.5B Instruct (475 MB)…"
+            flag = ["fetch", "--qwen"]
+        case "silero_vad", "speaker_embed", "onnx":
+            statusMessage = "Downloading ONNX VAD & Speaker Embedding models…"
+            flag = ["fetch", "--onnx"]
+        case "all":
+            statusMessage = "Downloading all local Mimir models…"
+            flag = ["fetch", "--all"]
+        default:
+            statusMessage = "Fetching whistle.cact (16.9 MB)…"
+            flag = ["fetch"]
+        }
+        Task {
+            let output = await runCli(flag)
+            self.activeModelTaskId = nil
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed.components(separatedBy: "\n").last ?? trimmed
+            }
+            self.refreshModelStatuses()
+        }
+    }
+
+    func deleteModel(_ id: String) {
+        activeModelTaskId = id
+        statusMessage = "Removing \(id)…"
+        Task {
+            let output = await runCli(["models", "delete", id])
+            self.activeModelTaskId = nil
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.refreshModelStatuses()
+        }
+    }
+
+    func revertSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        statusMessage = "Reverting transcript to raw Whistle text…"
+        Task {
+            let output = await runCli(["revert", sid])
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.selectSession(sid)
+        }
+    }
+
+    func cleanupSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        isCleaningSession = true
+        cleanupDone = 0
+        cleanupTotal = 0
+        statusMessage = "Running local Qwen transcript cleanup…"
+        let bin = mimirBinaryURL
+        Task {
+            let output: String = await withCheckedContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let proc = Process()
+                    proc.executableURL = bin
+                    proc.arguments = ["cleanup", sid, "--progress"]
+                    let outPipe = Pipe()
+                    let errPipe = Pipe()
+                    proc.standardOutput = outPipe
+                    proc.standardError = errPipe
+
+                    errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                        let data = handle.availableData
+                        guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                        for line in chunk.components(separatedBy: .newlines) where line.hasPrefix("PROGRESS:") {
+                            let parts = line.split(separator: ":")
+                            if parts.count == 3, let d = Int(parts[1]), let t = Int(parts[2]) {
+                                Task { @MainActor [weak self] in
+                                    self?.cleanupDone = d
+                                    self?.cleanupTotal = t
+                                }
+                            }
+                        }
+                    }
+
+                    try? proc.run()
+                    proc.waitUntilExit()
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    cont.resume(returning: String(data: outData, encoding: .utf8) ?? "")
+                }
+            }
+            self.isCleaningSession = false
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = trimmed
+            }
+            self.selectSession(sid)
         }
     }
 
@@ -481,5 +745,245 @@ final class MimirController: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Summarization, Presets & Config
+
+    func summarizeSelectedSession() {
+        guard let sid = selectedSessionId else { return }
+        isSummarizingSession = true
+        summarizeDone = 0
+        summarizeTotal = 0
+        let tmpl = selectedSummaryTemplate
+        statusMessage = "Summarizing session with Qwen 2.5 0.5B…"
+        let bin = mimirBinaryURL
+        Task {
+            let output: String = await withCheckedContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let proc = Process()
+                    proc.executableURL = bin
+                    proc.arguments = ["summarize", sid, "--template", tmpl, "--progress"]
+                    let outPipe = Pipe()
+                    let errPipe = Pipe()
+                    proc.standardOutput = outPipe
+                    proc.standardError = errPipe
+
+                    errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                        let data = handle.availableData
+                        guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                        for line in chunk.components(separatedBy: .newlines) where line.hasPrefix("PROGRESS:") {
+                            let parts = line.split(separator: ":")
+                            if parts.count == 3, let d = Int(parts[1]), let t = Int(parts[2]) {
+                                Task { @MainActor [weak self] in
+                                    self?.summarizeDone = d
+                                    self?.summarizeTotal = t
+                                }
+                            }
+                        }
+                    }
+
+                    try? proc.run()
+                    proc.waitUntilExit()
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    cont.resume(returning: String(data: outData, encoding: .utf8) ?? "")
+                }
+            }
+            self.isSummarizingSession = false
+            self.transcriptViewMode = "summary"
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                self.statusMessage = "Summarized session (\(tmpl))"
+            }
+            self.refreshSessions()
+            self.selectSession(sid)
+        }
+    }
+
+    func refreshPresets() {
+        Task {
+            let output = await runCli(["presets", "list", "--json"])
+            if let data = output.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([MimirKeywordPreset].self, from: data)
+            {
+                self.keywordPresets = decoded
+            }
+        }
+    }
+
+    func applyPreset(_ name: String) {
+        selectedPresetName = name
+        if let preset = keywordPresets.first(where: { $0.name == name }) {
+            presetNameInput = preset.name
+            keywordsText = preset.keywords.joined(separator: ", ")
+        }
+    }
+
+    func saveCurrentPreset() {
+        let name = presetNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let kws = keywordsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ",")
+        Task {
+            _ = await runCli(["presets", "save", name, "--keywords", kws])
+            self.selectedPresetName = name
+            self.statusMessage = "Saved keyword preset '\(name)'"
+            self.refreshPresets()
+        }
+    }
+
+    func deleteSelectedPreset() {
+        let name = selectedPresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        Task {
+            _ = await runCli(["presets", "delete", name])
+            self.selectedPresetName = ""
+            self.statusMessage = "Deleted keyword preset '\(name)'"
+            self.refreshPresets()
+        }
+    }
+
+    private var configFileURL: URL? {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("mimir/config.json")
+    }
+
+    func loadConfigFlags() {
+        guard let url = configFileURL,
+              let data = try? Data(contentsOf: url),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        if let autoSum = dict["auto_summarize"] as? Bool {
+            self.autoSummarize = autoSum
+        }
+        if let dropSync = dict["drop_sync_enabled"] as? Bool {
+            self.dropSyncEnabled = dropSync
+        }
+        if let tmpl = dict["default_summary_template"] as? String, !tmpl.isEmpty {
+            self.selectedSummaryTemplate = tmpl
+        }
+    }
+
+    func saveConfigFlags() {
+        guard let url = configFileURL else { return }
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var dict: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            dict = existing
+        }
+        dict["auto_summarize"] = autoSummarize
+        dict["drop_sync_enabled"] = dropSyncEnabled
+        dict["default_summary_template"] = selectedSummaryTemplate
+        if let encoded = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
+            try? encoded.write(to: url)
+        }
+    }
+
+    // MARK: - EventKit Local Calendar & Join & Record
+
+    func refreshCalendarEvents() {
+        let status = EKEventStore.authorizationStatus(for: .event)
+        switch status {
+        case .authorized, .fullAccess:
+            calendarAccessStatus = "Calendar connected"
+            loadUpcomingEventKitEvents()
+        case .notDetermined:
+            calendarAccessStatus = "Requesting calendar access…"
+            eventStore.requestFullAccessToEvents { [weak self] granted, _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if granted {
+                        self.calendarAccessStatus = "Calendar connected"
+                        self.loadUpcomingEventKitEvents()
+                    } else {
+                        self.calendarAccessStatus = "Calendar access denied (System Settings → Privacy & Security → Calendars)"
+                        self.upcomingEvents = []
+                    }
+                }
+            }
+        case .denied, .restricted, .writeOnly:
+            calendarAccessStatus = "Calendar access denied (System Settings → Privacy & Security → Calendars)"
+            upcomingEvents = []
+        @unknown default:
+            calendarAccessStatus = "Calendar unavailable"
+            upcomingEvents = []
+        }
+    }
+
+    private func loadUpcomingEventKitEvents() {
+        let now = Date()
+        let start = now.addingTimeInterval(-15 * 60)
+        let end = now.addingTimeInterval(60 * 60)
+        let predicate = eventStore.predicateForEvents(withStart: start, end: end, calendars: nil)
+        let rawEvents = eventStore.events(matching: predicate)
+        let mapped: [MimirCalendarEvent] = rawEvents.compactMap { ev in
+            guard !ev.isAllDay else { return nil }
+            let isOngoing = ev.startDate <= now && now <= ev.endDate
+            let startsSoon = abs(ev.startDate.timeIntervalSince(now)) <= 15 * 60
+            guard isOngoing || startsSoon else { return nil }
+            let url = ev.url
+                ?? Self.extractMeetingURL(from: ev.location ?? "")
+                ?? Self.extractMeetingURL(from: ev.notes ?? "")
+            let attendees = (ev.attendees ?? []).compactMap { participant in
+                participant.name ?? participant.url.absoluteString.replacingOccurrences(of: "mailto:", with: "")
+            }
+            return MimirCalendarEvent(
+                uid: ev.eventIdentifier ?? UUID().uuidString,
+                title: ev.title ?? "Untitled Meeting",
+                startDate: ev.startDate,
+                endDate: ev.endDate,
+                meetingUrl: url,
+                attendees: attendees,
+                notes: ev.notes
+            )
+        }
+        upcomingEvents = mapped.sorted { $0.startDate < $1.startDate }
+    }
+
+    func joinAndRecord(_ event: MimirCalendarEvent, openURL: Bool) {
+        if openURL, let url = event.meetingUrl {
+            NSWorkspace.shared.open(url)
+        }
+        sessionTitle = event.title
+        var existingKws = keywordsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for att in event.attendees {
+            if !existingKws.contains(where: { $0.caseInsensitiveCompare(att) == .orderedSame }) {
+                existingKws.append(att)
+            }
+        }
+        keywordsText = existingKws.joined(separator: ", ")
+        pendingCalendarEvent = event
+        startRecording()
+    }
+
+    private static func extractMeetingURL(from text: String) -> URL? {
+        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "<>\"'()"))
+        for token in text.components(separatedBy: separators) {
+            let cleaned = token.trimmingCharacters(in: CharacterSet(charactersIn: ",.;\\"))
+            let lower = cleaned.lowercased()
+            let isScheme = lower.hasPrefix("https://") || lower.hasPrefix("http://") || lower.hasPrefix("zoommtg://")
+            guard isScheme else { continue }
+            let isMeeting = lower.hasPrefix("zoommtg://")
+                || (lower.contains("zoom.us/") && (lower.contains("/j/") || lower.contains("/my/") || lower.contains("/wc/")))
+                || lower.contains("meet.google.com/")
+                || lower.contains("teams.microsoft.com/l/meetup-join")
+                || lower.contains("teams.live.com/meet/")
+                || (lower.contains("webex.com/") && (lower.contains("/meet/") || lower.contains("/join/") || lower.contains("j.php")))
+            if isMeeting, let url = URL(string: cleaned) {
+                return url
+            }
+        }
+        return nil
     }
 }

@@ -9,3 +9,4 @@ cpal.workspace = true
 mimir-core = { path = "../mimir-core" }
 rubato.workspace = true
 tracing.workspace = true
+tract-onnx.workspace = true

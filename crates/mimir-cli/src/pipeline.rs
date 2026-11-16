@@ -1,16 +1,26 @@
 //! Live and testable dual-channel audio -> Whistle -> Diarize -> Store pipeline.
 
 use chrono::Utc;
-use mimir_audio::{BleedGate, CapturedFrame, VadChunker};
+use mimir_audio::{BleedGate, CapturedFrame, SileroVadOnnx, VadChunker};
 use mimir_core::{AudioChunk, ChannelId, Result, Session, Utterance};
-use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
+use mimir_diarize::{
+    Diarizer, DiarizerConfig, OnnxSpeakerEmbedder, SpeakerEmbedder, insert_utterance_chronological,
+    mean_pool_frames,
+};
 use mimir_store::{SessionStore, sync_to_drop_dir};
 use mimir_whistle::{TranscribeOptions, TranscribeResult, WhistleEngine};
 use std::collections::HashSet;
-use std::path::Path;
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use tokio::sync::broadcast;
 use uuid::Uuid;
+
+/// Optional local accuracy enhancers (ONNX Silero VAD, ONNX Speaker Embeddings).
+#[derive(Default)]
+pub struct PipelineExtras {
+    pub silero_vad_path: Option<PathBuf>,
+    pub speaker_embedder: Option<Arc<OnnxSpeakerEmbedder>>,
+}
 
 /// Abstraction over Whistle inference so the full pipeline can be integration-tested deterministically.
 pub trait AsrBackend {
@@ -77,9 +87,49 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
     wav_dir: Option<&Path>,
     print_tail: bool,
 ) -> Result<()> {
+    run_pipeline_with_extras(
+        rx,
+        asr,
+        store,
+        session,
+        opts,
+        diarizer_cfg,
+        live_tx,
+        drop_dir,
+        wav_dir,
+        print_tail,
+        PipelineExtras::default(),
+    )
+}
+
+/// Processes `CapturedFrame`s with optional `.wav` retention and ONNX/Qwen accuracy enhancers.
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipeline_with_extras<A: AsrBackend>(
+    rx: mpsc::Receiver<CapturedFrame>,
+    asr: &A,
+    store: &SessionStore,
+    session: &mut Session,
+    opts: &TranscribeOptions,
+    diarizer_cfg: DiarizerConfig,
+    live_tx: Option<&broadcast::Sender<Utterance>>,
+    drop_dir: Option<&Path>,
+    wav_dir: Option<&Path>,
+    print_tail: bool,
+    extras: PipelineExtras,
+) -> Result<()> {
     let mut bleed_gate = BleedGate::default_20ms();
-    let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
-    let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
+    let mut mic_vad = extras
+        .silero_vad_path
+        .as_deref()
+        .and_then(|p| SileroVadOnnx::load(p, 0.45).ok())
+        .map(|s| VadChunker::with_silero(ChannelId::Mic, 0.015, s))
+        .unwrap_or_else(|| VadChunker::new(ChannelId::Mic, 0.015));
+    let mut sys_vad = extras
+        .silero_vad_path
+        .as_deref()
+        .and_then(|p| SileroVadOnnx::load(p, 0.45).ok())
+        .map(|s| VadChunker::with_silero(ChannelId::System, 0.012, s))
+        .unwrap_or_else(|| VadChunker::new(ChannelId::System, 0.012));
     let enrolled = store
         .list_voiceprints()
         .unwrap_or_default()
@@ -132,6 +182,7 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
                 &mut langs,
                 live_tx,
                 print_tail,
+                &extras,
             )?;
         }
     }
@@ -148,6 +199,7 @@ pub fn run_pipeline_with_wav<A: AsrBackend>(
             &mut langs,
             live_tx,
             print_tail,
+            &extras,
         )?;
     }
 
@@ -211,6 +263,7 @@ fn handle_chunk<A: AsrBackend>(
     langs: &mut HashSet<String>,
     live_tx: Option<&broadcast::Sender<Utterance>>,
     print_tail: bool,
+    extras: &PipelineExtras,
 ) -> Result<()> {
     let (res, raw_emb) = asr.transcribe_with_embedding(chunk, opts)?;
     let trimmed = res.text.trim();
@@ -218,13 +271,19 @@ fn handle_chunk<A: AsrBackend>(
         return Ok(());
     }
 
-    let pooled_emb = raw_emb.as_deref().and_then(|v| {
-        // Whistle encoder produces 80 ms frames; if flat length is unknown dim, treat as 1 frame if <= 1024.
-        if v.len() <= 512 {
-            Some(v.to_vec())
-        } else {
-            mean_pool_frames(v, 384).or_else(|| Some(v.to_vec()))
-        }
+    let onnx_emb = extras
+        .speaker_embedder
+        .as_ref()
+        .and_then(|emb| emb.embed(&chunk.samples).ok());
+    let pooled_emb = onnx_emb.or_else(|| {
+        raw_emb.as_deref().and_then(|v| {
+            // Whistle encoder produces 80 ms frames; if flat length is unknown dim, treat as 1 frame if <= 1024.
+            if v.len() <= 512 {
+                Some(v.to_vec())
+            } else {
+                mean_pool_frames(v, 384).or_else(|| Some(v.to_vec()))
+            }
+        })
     });
 
     let words = res.into_word_tokens(chunk.start_ms);
@@ -246,6 +305,7 @@ fn handle_chunk<A: AsrBackend>(
         start_ms: chunk.start_ms,
         end_ms,
         text: trimmed.to_string(),
+        raw_text: None,
         language: res.language.clone(),
         avg_confidence: avg_conf,
         words,

@@ -1,5 +1,7 @@
 //! Core domain types, configuration, and errors shared across all Mimir crates.
 
+pub mod calendar;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,6 +14,15 @@ pub const WHISTLE_SAMPLE_RATE: u32 = 16_000;
 
 /// Supported languages for base `whistle.cact`.
 pub const WHISTLE_LANGUAGES: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
+
+/// Supported built-in summary templates.
+pub const SUMMARY_TEMPLATES: [&str; 5] = [
+    "general",
+    "1on1",
+    "standup",
+    "sales_discovery",
+    "technical_review",
+];
 
 #[derive(Debug, Error)]
 pub enum MimirError {
@@ -80,10 +91,31 @@ pub struct Utterance {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     pub language: String,
     pub avg_confidence: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordToken>,
+}
+
+/// Structured action item extracted from a meeting transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+/// Named keyword biasing preset for quick switching across meeting types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeywordPreset {
+    pub name: String,
+    pub keywords: Vec<String>,
 }
 
 /// Complete meeting/conversation transcription record.
@@ -97,6 +129,18 @@ pub struct Session {
     pub keywords_used: Vec<String>,
     pub speakers: HashMap<String, SpeakerInfo>,
     pub utterances: Vec<Utterance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_markdown: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_items_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_event_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attendees_json: Option<String>,
 }
 
 impl Session {
@@ -121,6 +165,12 @@ impl Session {
             keywords_used: keywords,
             speakers,
             utterances: Vec::new(),
+            summary_markdown: None,
+            summary_template: None,
+            action_items_json: None,
+            calendar_event_uid: None,
+            meeting_url: None,
+            attendees_json: None,
         }
     }
 }
@@ -147,6 +197,14 @@ pub enum AudioRetention {
     ArchiveWav,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_summary_template() -> String {
+    "general".to_string()
+}
+
 /// Runtime configuration for Mimir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MimirConfig {
@@ -163,6 +221,18 @@ pub struct MimirConfig {
     pub auto_detect_calls: bool,
     #[serde(default)]
     pub encrypt_at_rest: bool,
+    #[serde(default)]
+    pub cleanup_enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_summarize: bool,
+    #[serde(default = "default_summary_template")]
+    pub default_summary_template: String,
+    #[serde(default)]
+    pub keyword_presets: Vec<KeywordPreset>,
+    #[serde(default)]
+    pub drop_sync_enabled: bool,
+    #[serde(default)]
+    pub calendar_ics_urls: Vec<String>,
 }
 
 impl Default for MimirConfig {
@@ -182,6 +252,12 @@ impl Default for MimirConfig {
             http_bind_addr: "127.0.0.1:7331".to_string(),
             auto_detect_calls: false,
             encrypt_at_rest: false,
+            cleanup_enabled: false,
+            auto_summarize: true,
+            default_summary_template: default_summary_template(),
+            keyword_presets: Vec::new(),
+            drop_sync_enabled: false,
+            calendar_ics_urls: Vec::new(),
         }
     }
 }

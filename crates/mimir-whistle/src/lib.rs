@@ -4,6 +4,7 @@
 //! completely bypassing the Python package and any Python-side telemetry.
 
 pub mod artifact;
+pub mod qwen;
 
 use libloading::{Library, Symbol};
 use mimir_core::{MimirError, Result, WHISTLE_SAMPLE_RATE, WordToken};
