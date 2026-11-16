@@ -159,6 +159,18 @@ fn tools_manifest() -> Value {
                 }
             },
             {
+                "name": "rename_session",
+                "description": "Rename a local Mimir session title without modifying its transcript or summary.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {
+                        "session_id": { "type": "string", "description": "UUID or 'latest'", "default": "latest" },
+                        "title": { "type": "string", "description": "New non-empty session title." }
+                    }
+                }
+            },
+            {
                 "name": "rename_speaker",
                 "description": "Assign a human-readable name to a diarized speaker (e.g. remote_1 -> Alice).",
                 "inputSchema": {
@@ -312,6 +324,31 @@ fn handle_tool_call(store: &SessionStore, params: &Value) -> std::result::Result
                 .map_err(|e| (-32000, e.to_string()))?;
             let json_hits = serde_json::to_string_pretty(&hits).map_err(|e| (-32000, e.to_string()))?;
             Ok(tool_text(wrap_untrusted_transcript(&json_hits)))
+        }
+        "rename_session" => {
+            let sid_raw = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest");
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or((-32602, "missing non-empty 'title'".to_string()))?;
+            let session = if sid_raw == "latest" {
+                store.latest_session().map_err(|e| (-32000, e.to_string()))?
+            } else {
+                let uuid = Uuid::parse_str(sid_raw).map_err(|e| (-32602, e.to_string()))?;
+                store.get_session(uuid).map_err(|e| (-32000, e.to_string()))?
+            };
+            let Some(session) = session else {
+                return Ok(tool_text("No transcription sessions found.".to_string()));
+            };
+            let updated = store
+                .rename_session(session.id, title)
+                .map_err(|e| (-32000, e.to_string()))?;
+            Ok(tool_text(format!("session_renamed={updated}")))
         }
         "rename_speaker" => {
             let sid = args
@@ -732,7 +769,8 @@ mod tests {
                 "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"get_live_transcript\",\"arguments\":{{\"last_n\":5}}}}}}\n",
                 "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{{\"name\":\"get_transcript\",\"arguments\":{{\"session_id\":\"{sid}\",\"view\":\"raw\"}}}}}}\n",
                 "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/list\",\"params\":{{}}}}\n",
-                "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/read\",\"params\":{{\"uri\":\"mimir://sessions/{sid}\"}}}}\n"
+                "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/read\",\"params\":{{\"uri\":\"mimir://sessions/{sid}\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{{\"name\":\"rename_session\",\"arguments\":{{\"session_id\":\"{sid}\",\"title\":\"ERAM Review v2\"}}}}}}\n"
             ),
             sid = sid
         );
@@ -741,7 +779,7 @@ mod tests {
 
         let output_str = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
 
         let list_resp: Value = serde_json::from_str(lines[0]).unwrap();
         assert!(list_resp["result"]["content"][0]["text"]
@@ -784,5 +822,11 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Architecture Review"));
+
+        let rename_sess_resp: Value = serde_json::from_str(lines[7]).unwrap();
+        assert_eq!(
+            rename_sess_resp["result"]["content"][0]["text"],
+            "session_renamed=true"
+        );
     }
 }

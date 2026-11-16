@@ -94,6 +94,8 @@ struct MimirDesktopApp {
     calendar_events: Vec<CalendarEvent>,
     calendar_ics_input: String,
     last_calendar_poll: std::time::Instant,
+    last_store_poll: std::time::Instant,
+    last_db_stamp: Option<std::time::SystemTime>,
     pending_calendar_meta: Option<(String, Option<String>, Vec<String>)>,
     connect_report: String,
     update_line: String,
@@ -110,6 +112,7 @@ impl MimirDesktopApp {
         let encrypt_at_rest = cfg.encrypt_at_rest;
         let diarize_mic = cfg.diarize_mic;
         let keywords_input = cfg.keywords.join(", ");
+        let initial_db_stamp = db_modified_stamp(&cfg.data_dir);
         let mut app = Self {
             cfg,
             tab: Tab::Live,
@@ -148,6 +151,8 @@ impl MimirDesktopApp {
             calendar_events: Vec::new(),
             calendar_ics_input: String::new(),
             last_calendar_poll: std::time::Instant::now(),
+            last_store_poll: std::time::Instant::now(),
+            last_db_stamp: initial_db_stamp,
             pending_calendar_meta: None,
             connect_report: String::new(),
             update_line: String::new(),
@@ -689,12 +694,25 @@ impl eframe::App for MimirDesktopApp {
         }
         if self.is_recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
-        } else if !self.cfg.calendar_ics_urls.is_empty() {
-            if self.last_calendar_poll.elapsed() >= std::time::Duration::from_secs(60) {
+        } else {
+            if self.last_store_poll.elapsed() >= std::time::Duration::from_secs(2) {
+                self.last_store_poll = std::time::Instant::now();
+                let stamp = db_modified_stamp(&self.cfg.data_dir);
+                if stamp != self.last_db_stamp {
+                    self.last_db_stamp = stamp;
+                    self.refresh_sessions();
+                    if let Some(sid) = self.selected_session_id {
+                        self.load_session(sid);
+                    }
+                }
+            }
+            if !self.cfg.calendar_ics_urls.is_empty()
+                && self.last_calendar_poll.elapsed() >= std::time::Duration::from_secs(60)
+            {
                 self.last_calendar_poll = std::time::Instant::now();
                 self.refresh_calendar_events();
             }
-            ctx.request_repaint_after(std::time::Duration::from_secs(60));
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
         }
 
         let rail_bg = egui::Color32::from_rgb(8, 12, 20);      // #080C14
@@ -1843,6 +1861,21 @@ fn save_pcm_wav_maybe_encrypted(
     }
 }
 
+
+fn db_modified_stamp(data_dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let db = std::fs::metadata(data_dir.join("mimir.db"))
+        .and_then(|m| m.modified())
+        .ok();
+    let wal = std::fs::metadata(data_dir.join("mimir.db-wal"))
+        .and_then(|m| m.modified())
+        .ok();
+    match (db, wal) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
 
 fn main() -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!(
