@@ -989,9 +989,47 @@ struct AssistantsTab: View {
                         controller.refreshCalendarEvents()
                     }
                     .buttonStyle(.bordered)
+                    if controller.calendarNeedsSettingsButton {
+                        Button("Open System Settings") {
+                            controller.openCalendarPrivacySettings()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                     Text(controller.calendarAccessStatus)
                         .font(.system(size: 11.5))
                         .foregroundStyle(MimirTheme.textSecondary)
+                }
+                HStack(spacing: 8) {
+                    TextField("https://...ics or /path/to/calendar.ics", text: $controller.calendarIcsInput)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(MimirTheme.panelBg)
+                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                        .onSubmit {
+                            controller.addCalendarIcsSource()
+                        }
+                    Button("Add .ics") {
+                        controller.addCalendarIcsSource()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                ForEach(Array(controller.calendarIcsUrls.enumerated()), id: \.offset) { idx, src in
+                    HStack(spacing: 8) {
+                        Text(src)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button("Remove") {
+                            controller.removeCalendarIcsSource(at: idx)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(MimirTheme.textMuted)
+                    }
                 }
             }
             .font(.system(size: 12.5))

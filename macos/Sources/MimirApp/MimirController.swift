@@ -142,6 +142,7 @@ final class MimirController: ObservableObject {
         refreshSessions()
         refreshPresets()
         refreshCalendarEvents()
+        startCalendarPolling()
         installHotkeys()
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
@@ -867,6 +868,9 @@ final class MimirController: ObservableObject {
         if let tmpl = dict["default_summary_template"] as? String, !tmpl.isEmpty {
             self.selectedSummaryTemplate = tmpl
         }
+        if let ics = dict["calendar_ics_urls"] as? [String] {
+            self.calendarIcsUrls = ics
+        }
     }
 
     func saveConfigFlags() {
@@ -882,49 +886,118 @@ final class MimirController: ObservableObject {
         dict["auto_summarize"] = autoSummarize
         dict["drop_sync_enabled"] = dropSyncEnabled
         dict["default_summary_template"] = selectedSummaryTemplate
+        dict["calendar_ics_urls"] = calendarIcsUrls
         if let encoded = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
             try? encoded.write(to: url)
         }
     }
 
-    // MARK: - EventKit Local Calendar & Join & Record
+    // MARK: - Calendar Integration (Apple Calendar EventKit + .ics Feeds) & Join & Record
+
+    func addCalendarIcsSource() {
+        let trimmed = calendarIcsInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if !calendarIcsUrls.contains(trimmed) {
+            calendarIcsUrls.append(trimmed)
+            saveConfigFlags()
+        }
+        calendarIcsInput = ""
+        refreshCalendarEvents()
+    }
+
+    func removeCalendarIcsSource(at index: Int) {
+        guard calendarIcsUrls.indices.contains(index) else { return }
+        calendarIcsUrls.remove(at: index)
+        saveConfigFlags()
+        refreshCalendarEvents()
+    }
+
+    func openCalendarPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func startCalendarPolling() {
+        calendarPollTask?.cancel()
+        calendarPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { break }
+                self?.refreshCalendarEvents()
+            }
+        }
+    }
 
     func refreshCalendarEvents() {
         let status = EKEventStore.authorizationStatus(for: .event)
         switch status {
         case .authorized, .fullAccess:
-            calendarAccessStatus = "Calendar connected"
-            loadUpcomingEventKitEvents()
+            calendarAccessStatus = "Apple Calendar connected"
+            calendarNeedsSettingsButton = false
+            reloadMergedCalendarEvents(includeEventKit: true)
         case .notDetermined:
-            calendarAccessStatus = "Requesting calendar access…"
+            calendarAccessStatus = "Requesting Apple Calendar access…"
+            calendarNeedsSettingsButton = false
+            reloadMergedCalendarEvents(includeEventKit: false)
             eventStore.requestFullAccessToEvents { [weak self] granted, _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if granted {
-                        self.calendarAccessStatus = "Calendar connected"
-                        self.loadUpcomingEventKitEvents()
+                        self.calendarAccessStatus = "Apple Calendar connected"
+                        self.calendarNeedsSettingsButton = false
+                        self.reloadMergedCalendarEvents(includeEventKit: true)
                     } else {
-                        self.calendarAccessStatus = "Calendar access denied (System Settings → Privacy & Security → Calendars)"
-                        self.upcomingEvents = []
+                        self.calendarAccessStatus = "Apple Calendar access denied (System Settings → Privacy & Security → Calendars)"
+                        self.calendarNeedsSettingsButton = true
+                        self.reloadMergedCalendarEvents(includeEventKit: false)
                     }
                 }
             }
         case .denied, .restricted, .writeOnly:
-            calendarAccessStatus = "Calendar access denied (System Settings → Privacy & Security → Calendars)"
-            upcomingEvents = []
+            calendarAccessStatus = "Apple Calendar access denied (System Settings → Privacy & Security → Calendars)"
+            calendarNeedsSettingsButton = true
+            reloadMergedCalendarEvents(includeEventKit: false)
         @unknown default:
-            calendarAccessStatus = "Calendar unavailable"
-            upcomingEvents = []
+            calendarAccessStatus = "Apple Calendar unavailable"
+            calendarNeedsSettingsButton = false
+            reloadMergedCalendarEvents(includeEventKit: false)
         }
     }
 
-    private func loadUpcomingEventKitEvents() {
+    private func reloadMergedCalendarEvents(includeEventKit: Bool) {
+        let ekEvents = includeEventKit ? fetchUpcomingEventKitEvents() : []
+        let icsSources = calendarIcsUrls
+        if icsSources.isEmpty {
+            self.upcomingEvents = ekEvents.sorted { $0.startDate < $1.startDate }
+            return
+        }
+        Task {
+            let icsEvents = await Task.detached(priority: .utility) {
+                Self.fetchUpcomingIcsEvents(from: icsSources)
+            }.value
+            var merged = ekEvents
+            for ev in icsEvents {
+                let duplicate = merged.contains { existing in
+                    existing.uid == ev.uid
+                        || (existing.title.caseInsensitiveCompare(ev.title) == .orderedSame
+                            && abs(existing.startDate.timeIntervalSince(ev.startDate)) < 60)
+                }
+                if !duplicate {
+                    merged.append(ev)
+                }
+            }
+            self.upcomingEvents = merged.sorted { $0.startDate < $1.startDate }
+        }
+    }
+
+    private func fetchUpcomingEventKitEvents() -> [MimirCalendarEvent] {
         let now = Date()
         let start = now.addingTimeInterval(-15 * 60)
         let end = now.addingTimeInterval(60 * 60)
         let predicate = eventStore.predicateForEvents(withStart: start, end: end, calendars: nil)
         let rawEvents = eventStore.events(matching: predicate)
-        let mapped: [MimirCalendarEvent] = rawEvents.compactMap { ev in
+        return rawEvents.compactMap { ev in
             guard !ev.isAllDay else { return nil }
             let isOngoing = ev.startDate <= now && now <= ev.endDate
             let startsSoon = abs(ev.startDate.timeIntervalSince(now)) <= 15 * 60
@@ -945,7 +1018,170 @@ final class MimirController: ObservableObject {
                 notes: ev.notes
             )
         }
-        upcomingEvents = mapped.sorted { $0.startDate < $1.startDate }
+    }
+
+    nonisolated private static func fetchUpcomingIcsEvents(from sources: [String]) -> [MimirCalendarEvent] {
+        let now = Date()
+        var results: [MimirCalendarEvent] = []
+        for src in sources {
+            let trimmed = src.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            var content: String?
+            if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://"),
+               let url = URL(string: trimmed)
+            {
+                let sem = DispatchSemaphore(value: 0)
+                let req = URLRequest(url: url, timeoutInterval: 10)
+                URLSession.shared.dataTask(with: req) { data, _, _ in
+                    if let data {
+                        content = String(data: data, encoding: .utf8)
+                    }
+                    sem.signal()
+                }.resume()
+                sem.wait()
+            } else {
+                let expanded = (trimmed as NSString).expandingTildeInPath
+                content = try? String(contentsOfFile: expanded, encoding: .utf8)
+            }
+            guard let ics = content else { continue }
+            for ev in parseIcsEvents(from: ics) {
+                let isOngoing = ev.startDate <= now && now <= ev.endDate
+                let startsSoon = abs(ev.startDate.timeIntervalSince(now)) <= 15 * 60
+                if isOngoing || startsSoon {
+                    results.append(ev)
+                }
+            }
+        }
+        return results
+    }
+
+    nonisolated private static func parseIcsEvents(from raw: String) -> [MimirCalendarEvent] {
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        var unfolded: [String] = []
+        for line in normalized.components(separatedBy: "\n") {
+            if (line.hasPrefix(" ") || line.hasPrefix("\t")), let last = unfolded.popLast() {
+                unfolded.append(last + String(line.dropFirst()))
+            } else {
+                unfolded.append(line)
+            }
+        }
+
+        var events: [MimirCalendarEvent] = []
+        var inEvent = false
+        var uid = ""
+        var title = ""
+        var startDate: Date?
+        var endDate: Date?
+        var location = ""
+        var description = ""
+        var urlProp: URL?
+        var attendees: [String] = []
+
+        for line in unfolded {
+            if line == "BEGIN:VEVENT" {
+                inEvent = true
+                uid = ""
+                title = ""
+                startDate = nil
+                endDate = nil
+                location = ""
+                description = ""
+                urlProp = nil
+                attendees = []
+                continue
+            }
+            if line == "END:VEVENT" {
+                if inEvent, let s = startDate {
+                    let e = endDate ?? s.addingTimeInterval(3600)
+                    let meetingUrl = urlProp
+                        ?? extractMeetingURL(from: location)
+                        ?? extractMeetingURL(from: description)
+                    events.append(MimirCalendarEvent(
+                        uid: uid.isEmpty ? UUID().uuidString : uid,
+                        title: title.isEmpty ? "Untitled Meeting" : title,
+                        startDate: s,
+                        endDate: e,
+                        meetingUrl: meetingUrl,
+                        attendees: attendees,
+                        notes: description.isEmpty ? nil : description
+                    ))
+                }
+                inEvent = false
+                continue
+            }
+            guard inEvent, let colonIdx = line.firstIndex(of: ":") else { continue }
+            let left = String(line[..<colonIdx])
+            let value = unescapeIcsText(String(line[line.index(after: colonIdx)...]))
+            let propName = left.split(separator: ";").first.map { String($0).uppercased() } ?? ""
+
+            switch propName {
+            case "UID":
+                uid = value
+            case "SUMMARY":
+                title = value
+            case "LOCATION":
+                location = value
+            case "DESCRIPTION":
+                description = value
+            case "URL":
+                if let u = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    urlProp = u
+                }
+            case "DTSTART":
+                startDate = parseIcsDate(value, params: left)
+            case "DTEND":
+                endDate = parseIcsDate(value, params: left)
+            case "ATTENDEE":
+                var cn: String?
+                for part in left.split(separator: ";").dropFirst() {
+                    if part.uppercased().hasPrefix("CN=") {
+                        cn = String(part.dropFirst(3)).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                    }
+                }
+                let email = value.replacingOccurrences(of: "mailto:", with: "", options: [.caseInsensitive, .anchored])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let label = (cn?.isEmpty == false ? cn! : email)
+                if !label.isEmpty && !attendees.contains(where: { $0.caseInsensitiveCompare(label) == .orderedSame }) {
+                    attendees.append(label)
+                }
+            default:
+                break
+            }
+        }
+        return events
+    }
+
+    nonisolated private static func unescapeIcsText(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\N", with: "\n")
+            .replacingOccurrences(of: "\\,", with: ",")
+            .replacingOccurrences(of: "\\;", with: ";")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+    }
+
+    nonisolated private static func parseIcsDate(_ value: String, params: String) -> Date? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        var tz: TimeZone = .current
+        for part in params.split(separator: ";").dropFirst() {
+            if part.uppercased().hasPrefix("TZID=") {
+                let tzId = String(part.dropFirst(5)).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                if let found = TimeZone(identifier: tzId) {
+                    tz = found
+                }
+            }
+        }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        if trimmed.hasSuffix("Z") {
+            fmt.timeZone = TimeZone(secondsFromGMT: 0)
+            fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+            if let d = fmt.date(from: trimmed) { return d }
+        }
+        fmt.timeZone = tz
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss"
+        if let d = fmt.date(from: trimmed) { return d }
+        fmt.dateFormat = "yyyyMMdd"
+        return fmt.date(from: trimmed)
     }
 
     func joinAndRecord(_ event: MimirCalendarEvent, openURL: Bool) {

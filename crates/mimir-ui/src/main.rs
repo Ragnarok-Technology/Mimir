@@ -89,6 +89,7 @@ struct MimirDesktopApp {
     summarize_progress: Option<(usize, usize)>,
     calendar_events: Vec<CalendarEvent>,
     calendar_ics_input: String,
+    last_calendar_poll: std::time::Instant,
     pending_calendar_meta: Option<(String, Option<String>, Vec<String>)>,
     connect_report: String,
     update_line: String,
@@ -648,6 +649,12 @@ impl eframe::App for MimirDesktopApp {
         }
         if self.is_recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        } else if !self.cfg.calendar_ics_urls.is_empty() {
+            if self.last_calendar_poll.elapsed() >= std::time::Duration::from_secs(60) {
+                self.last_calendar_poll = std::time::Instant::now();
+                self.refresh_calendar_events();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(60));
         }
 
         let rail_bg = egui::Color32::from_rgb(8, 12, 20);      // #080C14

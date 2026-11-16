@@ -58,6 +58,10 @@ cat << 'PLIST' > "$CONTENTS_DIR/Info.plist"
     <string>Mimir captures your local microphone audio to transcribe your voice 100% locally via Whistle AI.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Mimir captures system speaker audio via ScreenCaptureKit so remote meeting participants are transcribed 100% locally.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Mimir reads your local calendar events to show upcoming meetings and enable 1-click Join &amp; Record.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Mimir reads your local calendar events to show upcoming meetings and enable 1-click Join &amp; Record.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
