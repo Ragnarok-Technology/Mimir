@@ -744,7 +744,10 @@ impl eframe::App for MimirDesktopApp {
                             {
                                 let md = render_markdown_with_view(&sess, TranscriptView::Cleaned);
                                 ctx.copy_text(md);
-                                self.status_line = format!("Copied '{}' to clipboard.", sess.title);
+                                self.status_line = format!(
+                                    "Copied '{}' to clipboard.",
+                                    sess.title.as_deref().unwrap_or("Untitled")
+                                );
                             } else {
                                 self.status_line = "No sessions available to copy.".into();
                             }
