@@ -113,18 +113,6 @@ enum Commands {
         #[arg(long)]
         progress: bool,
     },
-    /// Generate a local Qwen 2.5 0.5B summary, action items, and auto-title for a session.
-    Summarize {
-        session_id: Uuid,
-        /// Summary template (`general`, `1on1`, `standup`, `sales_discovery`, `technical_review`).
-        #[arg(long)]
-        template: Option<String>,
-        #[arg(long)]
-        json: bool,
-        /// Emit machine-readable `PROGRESS:<done>:<total>` lines to stderr as steps finish.
-        #[arg(long)]
-        progress: bool,
-    },
     /// List, save, or delete named keyword biasing presets.
     Presets {
         #[command(subcommand)]
@@ -423,44 +411,6 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Commands::Summarize {
-            session_id,
-            template,
-            json,
-            progress,
-        } => {
-            let tmpl = template
-                .as_deref()
-                .unwrap_or(&cfg.default_summary_template);
-            let res = run_session_summarize(&cfg, session_id, tmpl, progress)?;
-            let store = SessionStore::open(&cfg.data_dir)?;
-            let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store, session_id, &cfg);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "session_id": session_id,
-                        "template": res.summary_template,
-                        "auto_title": res.auto_title,
-                        "summary_markdown": res.summary_markdown,
-                        "action_items": res.action_items,
-                    }))?
-                );
-            } else {
-                if let Some(ref t) = res.auto_title {
-                    println!("Title: {t}");
-                }
-                println!("Template: {}", res.summary_template);
-                println!("\n{}", res.summary_markdown);
-                if !res.action_items.is_empty() {
-                    println!("\nAction Items:");
-                    for item in &res.action_items {
-                        let owner = item.owner.as_deref().unwrap_or("Unassigned");
-                        println!("- [{}] {}", owner, item.task);
-                    }
-                }
-            }
-        }
         Commands::Presets { action } => {
             let mut cfg_mut = cfg.clone();
             match action {
@@ -672,29 +622,6 @@ async fn main() -> Result<()> {
                     updated,
                     if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
                 );
-            }
-            if cfg.auto_summarize {
-                let (qwen_weights, qwen_tok) = resolve_qwen_paths(&cfg);
-                if qwen_weights.is_file() && qwen_tok.is_file() {
-                    match run_session_summarize(
-                        &cfg,
-                        session_id,
-                        &cfg.default_summary_template,
-                        false,
-                    ) {
-                        Ok(res) => {
-                            eprintln!(
-                                "Summarized session {} (template: {}, action items: {}).",
-                                session_id,
-                                res.summary_template,
-                                res.action_items.len()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("Auto-summarize skipped: {e}");
-                        }
-                    }
-                }
             }
             if let Ok(store_after) = SessionStore::open(&cfg.data_dir) {
                 let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store_after, session_id, &cfg);
@@ -1001,30 +928,4 @@ fn run_session_cleanup(
         },
     )?;
     Ok((updated, used_qwen))
-}
-
-fn run_session_summarize(
-    cfg: &MimirConfig,
-    session_id: Uuid,
-    template: &str,
-    emit_progress: bool,
-) -> Result<mimir_store::summarize::SessionSummaryResult> {
-    let store = SessionStore::open(&cfg.data_dir)?;
-    let (qwen_weights, qwen_tok) = resolve_qwen_paths(cfg);
-    anyhow::ensure!(
-        qwen_weights.is_file() && qwen_tok.is_file(),
-        "Qwen 2.5 0.5B Instruct is not installed (run `mimir fetch --qwen`)"
-    );
-    let mut qwen_model = QwenCleanupModel::load(&qwen_weights, &qwen_tok)?;
-    let res = store.summarize_session_with_progress(
-        session_id,
-        template,
-        |sys, usr, max_tok| qwen_model.complete(sys, usr, max_tok),
-        |done, total| {
-            if emit_progress {
-                eprintln!("PROGRESS:{done}:{total}");
-            }
-        },
-    )?;
-    Ok(res)
 }

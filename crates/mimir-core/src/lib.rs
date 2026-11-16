@@ -15,16 +15,6 @@ pub const WHISTLE_SAMPLE_RATE: u32 = 16_000;
 /// Supported languages for base `whistle.cact`.
 pub const WHISTLE_LANGUAGES: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
 
-/// Supported built-in summary templates.
-pub const SUMMARY_TEMPLATES: [&str; 6] = [
-    "general",
-    "meeting",
-    "1on1",
-    "standup",
-    "sales_discovery",
-    "technical_review",
-];
-
 #[derive(Debug, Error)]
 pub enum MimirError {
     #[error("audio capture error: {0}")]
@@ -198,14 +188,6 @@ pub enum AudioRetention {
     ArchiveWav,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_summary_template() -> String {
-    "general".to_string()
-}
-
 /// Runtime configuration for Mimir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MimirConfig {
@@ -224,10 +206,6 @@ pub struct MimirConfig {
     pub encrypt_at_rest: bool,
     #[serde(default)]
     pub cleanup_enabled: bool,
-    #[serde(default = "default_true")]
-    pub auto_summarize: bool,
-    #[serde(default = "default_summary_template")]
-    pub default_summary_template: String,
     #[serde(default)]
     pub keyword_presets: Vec<KeywordPreset>,
     #[serde(default)]
@@ -254,8 +232,6 @@ impl Default for MimirConfig {
             auto_detect_calls: false,
             encrypt_at_rest: false,
             cleanup_enabled: false,
-            auto_summarize: true,
-            default_summary_template: default_summary_template(),
             keyword_presets: Vec::new(),
             drop_sync_enabled: false,
             calendar_ics_urls: Vec::new(),

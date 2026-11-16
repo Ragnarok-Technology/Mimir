@@ -2,7 +2,6 @@
 
 pub mod cleanup;
 pub mod export;
-pub mod summarize;
 
 use chrono::{DateTime, Utc};
 use mimir_core::{
@@ -619,169 +618,6 @@ impl SessionStore {
         Ok(rows > 0)
     }
 
-    /// Runs local map-reduce summarization, action-item extraction, and conditional auto-titling
-    /// using the provided `complete(system, user, max_new_tokens)` callback (e.g. `QwenCleanupModel::complete`).
-    pub fn summarize_session_with_progress<F, P>(
-        &self,
-        session_id: Uuid,
-        template: &str,
-        mut complete: F,
-        mut on_progress: P,
-    ) -> Result<summarize::SessionSummaryResult>
-    where
-        F: FnMut(&str, &str, usize) -> Result<String>,
-        P: FnMut(usize, usize),
-    {
-        let Some(session) = self.get_session(session_id)? else {
-            return Err(MimirError::Storage(format!("session {session_id} not found")));
-        };
-
-        let norm_template = summarize::normalize_template_name(template).to_string();
-        let lines = summarize::format_transcript_lines(&session);
-        if lines.is_empty() {
-            let empty_json = "[]".to_string();
-            self.update_session_summary(
-                session_id,
-                Some("No spoken utterances recorded in this session."),
-                Some(&norm_template),
-                Some(&empty_json),
-            )?;
-            on_progress(1, 1);
-            return Ok(summarize::SessionSummaryResult {
-                summary_markdown: "No spoken utterances recorded in this session.".to_string(),
-                summary_template: norm_template,
-                action_items: Vec::new(),
-                action_items_json: empty_json,
-                auto_title: None,
-            });
-        }
-
-        let chunks = summarize::chunk_transcript_lines(&lines, summarize::DEFAULT_SUMMARY_CHUNK_CHARS);
-        let needs_title = summarize::is_default_or_timestamped_title(session.title.as_deref());
-        let context_hint = session
-            .title
-            .as_deref()
-            .filter(|t| !summarize::is_default_or_timestamped_title(Some(t)));
-
-        // Fast single-pass path for short transcripts under the universal `general` mode.
-        if chunks.len() == 1
-            && chunks[0].len() <= summarize::SHORT_TRANSCRIPT_MAX_CHARS
-            && norm_template == "general"
-        {
-            on_progress(0, 1);
-            let (sys, usr) = summarize::build_short_universal_summary_prompt(
-                &chunks[0],
-                needs_title,
-                context_hint,
-            );
-            let max_tokens = (chunks[0].len() / 4).clamp(80, 160);
-            let raw = complete(&sys, &usr, max_tokens)?;
-            let (auto_title, summary_markdown, action_items) =
-                summarize::parse_short_universal_response(&raw, needs_title);
-            if let Some(ref t) = auto_title {
-                let _ = self.rename_session(session_id, t);
-            }
-            let action_items_json = serde_json::to_string(&action_items)
-                .map_err(|e| MimirError::Storage(e.to_string()))?;
-            self.update_session_summary(
-                session_id,
-                Some(&summary_markdown),
-                Some(&norm_template),
-                Some(&action_items_json),
-            )?;
-            on_progress(1, 1);
-            return Ok(summarize::SessionSummaryResult {
-                summary_markdown,
-                summary_template: norm_template,
-                action_items,
-                action_items_json,
-                auto_title,
-            });
-        }
-
-        let map_steps = if chunks.len() > 1 { chunks.len() } else { 0 };
-        let run_actions = norm_template != "general"
-            || summarize::should_extract_action_items(&chunks.join("\n"), session.speakers.len());
-        let total_steps = map_steps + 1 + usize::from(run_actions) + usize::from(needs_title);
-        let mut done = 0usize;
-        on_progress(done, total_steps);
-
-        let combined_notes = if chunks.len() > 1 {
-            let mut partials = Vec::with_capacity(chunks.len());
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let (sys, usr) = summarize::build_chunk_map_prompt(chunk, idx, chunks.len());
-                let note = complete(&sys, &usr, 160)?;
-                if !note.trim().is_empty() {
-                    partials.push(note.trim().to_string());
-                }
-                done += 1;
-                on_progress(done, total_steps);
-            }
-            partials.join("\n\n")
-        } else {
-            chunks[0].clone()
-        };
-
-        let summary_budget = (combined_notes.len() / 7).clamp(160, 360);
-        let (sum_sys, sum_usr) =
-            summarize::build_summary_reduce_prompt(&combined_notes, &norm_template, context_hint);
-        let summary_markdown = complete(&sum_sys, &sum_usr, summary_budget)?.trim().to_string();
-        done += 1;
-        on_progress(done, total_steps);
-
-        let action_items = if run_actions {
-            let speaker_labels: Vec<String> = session
-                .speakers
-                .values()
-                .map(|s| s.label.clone())
-                .collect();
-            let (act_sys, act_usr) =
-                summarize::build_action_items_prompt(&combined_notes, &speaker_labels);
-            let raw_actions = complete(&act_sys, &act_usr, 180)?;
-            done += 1;
-            on_progress(done, total_steps);
-            summarize::parse_action_items_response(&raw_actions)
-        } else {
-            Vec::new()
-        };
-        let action_items_json = serde_json::to_string(&action_items)
-            .map_err(|e| MimirError::Storage(e.to_string()))?;
-
-        let auto_title = if needs_title {
-            let title_input = if summary_markdown.is_empty() {
-                combined_notes.as_str()
-            } else {
-                summary_markdown.as_str()
-            };
-            let (title_sys, title_usr) = summarize::build_auto_title_prompt(title_input);
-            let raw_title = complete(&title_sys, &title_usr, 24)?;
-            let sanitized = summarize::sanitize_auto_title(&raw_title);
-            if let Some(ref t) = sanitized {
-                let _ = self.rename_session(session_id, t);
-            }
-            done += 1;
-            on_progress(done, total_steps);
-            sanitized
-        } else {
-            None
-        };
-
-        self.update_session_summary(
-            session_id,
-            Some(&summary_markdown),
-            Some(&norm_template),
-            Some(&action_items_json),
-        )?;
-
-        Ok(summarize::SessionSummaryResult {
-            summary_markdown,
-            summary_template: norm_template,
-            action_items,
-            action_items_json,
-            auto_title,
-        })
-    }
-
     /// Loads a full `Session` (including speakers and chronologically ordered utterances).
     pub fn get_session(&self, session_id: Uuid) -> Result<Option<Session>> {
         let row: Option<(
@@ -1148,57 +984,46 @@ mod tests {
     }
 
     #[test]
-    fn summarize_session_persists_summary_actions_autotitle_and_exports() {
+    fn update_session_summary_persists_and_exports() {
         let dir = TempDir::new().unwrap();
         let store = SessionStore::open(dir.path()).unwrap();
 
-        let mut session = Session::new(None, vec!["Mimir".into()]);
+        let mut session = Session::new(Some("Architecture Sync".into()), vec!["Mimir".into()]);
         session.calendar_event_uid = Some("cal-evt-42".into());
         session.meeting_url = Some("https://meet.google.com/abc-defg-hij".into());
         session.attendees_json = Some(r#"["Host","Alice"]"#.into());
         store.create_session(&session).unwrap();
 
-        let u1 = sample_utterance(ChannelId::Mic, "host", 1000, "We should ship local Qwen summaries this week.");
-        let u2 = sample_utterance(ChannelId::System, "host", 4000, "I will update the SQLite schema by Friday.");
+        let u1 = sample_utterance(ChannelId::Mic, "host", 1000, "Let's keep summaries in MCP.");
         store.append_utterance(session.id, &u1).unwrap();
-        store.append_utterance(session.id, &u2).unwrap();
 
-        let mut progress_calls = Vec::new();
-        let res = store
-            .summarize_session_with_progress(
-                session.id,
-                "technical_review",
-                |sys, _usr, _max| {
-                    if sys.contains("JSON array") {
-                        Ok(r#"[{"owner":"Host","task":"Update SQLite schema","due_hint":"Friday","timestamp":"00:00:04"}]"#.into())
-                    } else if sys.contains("3 to 7 word") {
-                        Ok("Local Qwen Summary Review".into())
-                    } else {
-                        Ok("### Key Decisions\n- Ship local Qwen summaries this week.".into())
-                    }
-                },
-                |done, total| progress_calls.push((done, total)),
-            )
-            .unwrap();
-
-        assert_eq!(res.summary_template, "technical_review");
-        assert_eq!(res.auto_title.as_deref(), Some("Local Qwen Summary Review"));
-        assert_eq!(res.action_items.len(), 1);
-        assert_eq!(progress_calls.last(), Some(&(3, 3)));
+        let actions_json = r#"[{"owner":"Host","task":"Update MCP tools","due_hint":"Friday","timestamp":"00:00:01"}]"#;
+        assert!(
+            store
+                .update_session_summary(
+                    session.id,
+                    Some("MCP clients handle summarization and store results here."),
+                    Some("notes"),
+                    Some(actions_json),
+                )
+                .unwrap()
+        );
 
         let loaded = store.get_session(session.id).unwrap().unwrap();
-        assert_eq!(loaded.title.as_deref(), Some("Local Qwen Summary Review"));
         assert_eq!(loaded.calendar_event_uid.as_deref(), Some("cal-evt-42"));
         assert_eq!(
             loaded.meeting_url.as_deref(),
             Some("https://meet.google.com/abc-defg-hij")
         );
-        assert!(loaded.summary_markdown.as_deref().unwrap().contains("Key Decisions"));
+        assert_eq!(
+            loaded.summary_markdown.as_deref(),
+            Some("MCP clients handle summarization and store results here.")
+        );
 
         let md = export::render_session(&loaded, TranscriptFormat::Markdown).unwrap();
-        assert!(md.contains("## Summary (technical_review)"));
+        assert!(md.contains("## Summary (notes)"));
         assert!(md.contains("## Action Items"));
-        assert!(md.contains("**Host:** Update SQLite schema (due: Friday, @ 00:00:04)"));
+        assert!(md.contains("**Host:** Update MCP tools (due: Friday, @ 00:00:01)"));
         assert!(md.contains("**Meeting URL:** https://meet.google.com/abc-defg-hij"));
 
         let mut cfg = MimirConfig::default();
@@ -1207,41 +1032,7 @@ mod tests {
         let synced = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg).unwrap();
         assert!(synced.is_some());
         let (md_path, _) = synced.unwrap();
-        assert!(std::fs::read_to_string(md_path).unwrap().contains("## Summary (technical_review)"));
-    }
-
-    #[test]
-    fn short_universal_summary_uses_single_llm_pass() {
-        let dir = TempDir::new().unwrap();
-        let store = SessionStore::open(dir.path()).unwrap();
-        let session = Session::new(None, vec![]);
-        store.create_session(&session).unwrap();
-        let u1 = sample_utterance(
-            ChannelId::Mic,
-            "host",
-            0,
-            "Remember to grab coffee beans on the way home.",
-        );
-        store.append_utterance(session.id, &u1).unwrap();
-
-        let mut call_count = 0usize;
-        let res = store
-            .summarize_session_with_progress(
-                session.id,
-                "general",
-                |_sys, _usr, max_tok| {
-                    call_count += 1;
-                    assert!(max_tok <= 160);
-                    Ok("Title: Coffee Beans Reminder\n\nReminder to pick up coffee beans on the way home.".into())
-                },
-                |_done, _total| {},
-            )
-            .unwrap();
-
-        assert_eq!(call_count, 1);
-        assert_eq!(res.auto_title.as_deref(), Some("Coffee Beans Reminder"));
-        assert!(!res.summary_markdown.contains("Key Decisions"));
-        assert!(res.action_items.is_empty());
+        assert!(std::fs::read_to_string(md_path).unwrap().contains("## Summary (notes)"));
     }
 }
 

@@ -127,7 +127,7 @@ private enum MimirTheme {
 private enum WorkspaceSection: String, CaseIterable {
     case live = "Live"
     case transcripts = "Transcripts"
-    case assistants = "Assistants & Updates"
+    case settings = "Settings"
 }
 
 private struct MimirPrismMark: View {
@@ -278,8 +278,8 @@ struct MainView: View {
                         RecordTab(controller: controller)
                     case .transcripts:
                         SessionsTab(controller: controller)
-                    case .assistants:
-                        AssistantsTab(controller: controller)
+                    case .settings:
+                        SettingsTab(controller: controller)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -302,7 +302,7 @@ struct MainView: View {
 
                 Button("Connect AI (MCP)") {
                     controller.connectAssistants()
-                    section = .assistants
+                    section = .settings
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 11.5, weight: .medium))
@@ -362,23 +362,6 @@ private struct LeftControlRail: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             .buttonStyle(.plain)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("CAPTURE")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(MimirTheme.textMuted)
-                Toggle("System Audio", isOn: $controller.captureSystemAudio)
-                    .disabled(controller.isRecording)
-                Toggle("Multi-Speaker Mic", isOn: $controller.diarizeMic)
-                    .disabled(controller.isRecording)
-                Toggle("Save Local WAVs", isOn: $controller.saveWav)
-                    .disabled(controller.isRecording)
-                Toggle("Post-Process Cleanup", isOn: $controller.enableCleanup)
-                    .disabled(controller.isRecording)
-                Toggle("Auto-Detect Calls", isOn: $controller.autoDetectCalls)
-            }
-            .font(.system(size: 12))
-            .foregroundStyle(MimirTheme.textSecondary)
 
             Rectangle().fill(MimirTheme.hairline).frame(height: 1)
 
@@ -509,46 +492,25 @@ struct RecordTab: View {
             .font(.system(size: 12.5))
             .foregroundStyle(MimirTheme.textPrimary)
 
-            HStack(spacing: 8) {
-                Text("Preset:")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(MimirTheme.textSecondary)
-                Picker("Preset", selection: Binding(
-                    get: { controller.selectedPresetName },
-                    set: { controller.applyPreset($0) }
-                )) {
-                    Text("Select preset…").tag("")
-                    ForEach(controller.keywordPresets) { preset in
-                        Text(preset.name).tag(preset.name)
+            if !controller.keywordPresets.isEmpty {
+                HStack(spacing: 8) {
+                    Text("Preset:")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(MimirTheme.textSecondary)
+                    Picker("Preset", selection: Binding(
+                        get: { controller.selectedPresetName },
+                        set: { controller.applyPreset($0) }
+                    )) {
+                        Text("Select preset…").tag("")
+                        ForEach(controller.keywordPresets) { preset in
+                            Text(preset.name).tag(preset.name)
+                        }
                     }
+                    .labelsHidden()
+                    .frame(width: 160)
+                    .disabled(controller.isRecording)
+                    Spacer()
                 }
-                .labelsHidden()
-                .frame(width: 150)
-
-                TextField("Preset name", text: $controller.presetNameInput)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(MimirTheme.textPrimary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .frame(width: 130)
-                    .background(MimirTheme.cardBg)
-                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
-
-                Button("Save Preset") {
-                    controller.saveCurrentPreset()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                if !controller.selectedPresetName.isEmpty {
-                    Button("Delete Preset") {
-                        controller.deleteSelectedPreset()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-                Spacer()
             }
 
             ScrollViewReader { proxy in
@@ -746,43 +708,22 @@ struct SessionsTab: View {
                     Text("This permanently deletes the transcript and its local search index.")
                 }
 
-                Picker("View", selection: $controller.transcriptViewMode) {
-                    Text("Cleaned").tag("cleaned")
-                    Text("Raw").tag("raw")
-                    Text("Diff").tag("diff")
-                    Text("Summary").tag("summary")
+                if controller.selectedHasCleaned || controller.selectedHasSummary {
+                    Picker("View", selection: $controller.transcriptViewMode) {
+                        Text(controller.selectedHasCleaned ? "Cleaned" : "Transcript").tag("cleaned")
+                        if controller.selectedHasCleaned {
+                            Text("Raw").tag("raw")
+                            Text("Diff").tag("diff")
+                        }
+                        if controller.selectedHasSummary {
+                            Text("Summary").tag("summary")
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize(horizontal: true, vertical: false)
+                    .disabled(selectedSummary == nil)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 240)
-                .fixedSize(horizontal: true, vertical: false)
-                .disabled(selectedSummary == nil)
-
-                Picker("Template", selection: $controller.selectedSummaryTemplate) {
-                    Text("General").tag("general")
-                    Text("Meeting").tag("meeting")
-                    Text("1-on-1").tag("1on1")
-                    Text("Standup").tag("standup")
-                    Text("Sales").tag("sales_discovery")
-                    Text("Tech Review").tag("technical_review")
-                }
-                .labelsHidden()
-                .frame(width: 120)
-                .disabled(selectedSummary == nil || controller.isSummarizingSession)
-
-                Button(controller.isSummarizingSession ? "Summarizing…" : "Summarize") {
-                    controller.summarizeSelectedSession()
-                }
-                .buttonStyle(.plain)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(MimirTheme.ice)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(MimirTheme.activeFill)
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.ice.opacity(0.5), lineWidth: 1))
-                .disabled(selectedSummary == nil || controller.isSummarizingSession)
 
                 Button(controller.isCleaningSession ? "Cleaning…" : "Run Cleanup") {
                     controller.cleanupSelectedSession()
@@ -798,19 +739,21 @@ struct SessionsTab: View {
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.cyan.opacity(0.5), lineWidth: 1))
                 .disabled(selectedSummary == nil || controller.isCleaningSession)
 
-                Button("Revert Raw") {
-                    controller.revertSelectedSession()
+                if controller.selectedHasCleaned {
+                    Button("Revert Raw") {
+                        controller.revertSelectedSession()
+                    }
+                    .buttonStyle(.plain)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(MimirTheme.textSecondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(MimirTheme.cardBg)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                    .disabled(selectedSummary == nil || controller.isCleaningSession)
                 }
-                .buttonStyle(.plain)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(MimirTheme.textSecondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(MimirTheme.cardBg)
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
-                .disabled(selectedSummary == nil || controller.isCleaningSession)
 
                 Button("Copy Markdown") {
                     controller.copySelectedTranscript()
@@ -851,32 +794,6 @@ struct SessionsTab: View {
                 .padding(.vertical, 6)
                 .background(MimirTheme.cardBg)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.cyan.opacity(0.35), lineWidth: 1))
-            }
-
-            if controller.isSummarizingSession {
-                HStack(spacing: 10) {
-                    if controller.summarizeTotal > 0 {
-                        ProgressView(
-                            value: Double(controller.summarizeDone),
-                            total: Double(controller.summarizeTotal)
-                        )
-                        .progressViewStyle(.linear)
-                        .tint(MimirTheme.ice)
-                        Text("Step \(controller.summarizeDone) / \(controller.summarizeTotal)")
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(MimirTheme.ice)
-                    } else {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Loading Qwen 2.5 0.5B…")
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(MimirTheme.textSecondary)
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(MimirTheme.cardBg)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.ice.opacity(0.35), lineWidth: 1))
             }
 
             HStack(spacing: 8) {
@@ -921,11 +838,11 @@ struct SessionsTab: View {
             ScrollView {
                 if controller.transcriptViewMode == "summary" {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("SUMMARY (\(controller.selectedSummaryTemplate))")
+                        Text(controller.selectedSummaryTemplate.isEmpty ? "SUMMARY" : "SUMMARY (\(controller.selectedSummaryTemplate))")
                             .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                             .foregroundStyle(MimirTheme.ice)
                         if controller.selectedSummaryMarkdown.isEmpty {
-                            Text("No summary generated yet — click Summarize above.")
+                            Text("No summary saved yet — your MCP assistant can generate and store one via save_summary.")
                                 .font(.system(size: 13))
                                 .foregroundStyle(MimirTheme.textMuted)
                         } else {
@@ -968,191 +885,265 @@ struct SessionsTab: View {
     }
 }
 
-struct AssistantsTab: View {
+struct SettingsTab: View {
     @ObservedObject var controller: MimirController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("AUTOMATION & CALENDAR")
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(MimirTheme.textMuted)
-                Toggle("Auto-summarize after recording (Qwen 2.5 0.5B)", isOn: Binding(
-                    get: { controller.autoSummarize },
-                    set: { controller.autoSummarize = $0; controller.saveConfigFlags() }
-                ))
-                Toggle("Sync exports to Drop Folder on stop / cleanup / summarize", isOn: Binding(
-                    get: { controller.dropSyncEnabled },
-                    set: { controller.dropSyncEnabled = $0; controller.saveConfigFlags() }
-                ))
-                HStack(spacing: 10) {
-                    Button("Refresh Calendar") {
-                        controller.refreshCalendarEvents()
-                    }
-                    .buttonStyle(.bordered)
-                    if controller.calendarNeedsGrantButton {
-                        Button("Grant Calendar Access") {
-                            controller.requestCalendarAccess()
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    if controller.calendarNeedsSettingsButton {
-                        Button("Open System Settings") {
-                            controller.openCalendarPrivacySettings()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("CAPTURE & EXPORTS")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(MimirTheme.textMuted)
+                    Toggle("Capture System Audio (ScreenCaptureKit)", isOn: $controller.captureSystemAudio)
+                        .disabled(controller.isRecording)
+                    Toggle("Multi-Speaker Mic Diarization", isOn: $controller.diarizeMic)
+                        .disabled(controller.isRecording)
+                    Toggle("Save Local WAV Archives", isOn: $controller.saveWav)
+                        .disabled(controller.isRecording)
+                    Toggle("Post-Process Transcript Cleanup on Stop", isOn: $controller.enableCleanup)
+                        .disabled(controller.isRecording)
+                    Toggle("Auto-Detect Calls", isOn: $controller.autoDetectCalls)
+                    Toggle("Sync exports to Drop Folder on stop / cleanup / MCP save", isOn: Binding(
+                        get: { controller.dropSyncEnabled },
+                        set: { controller.dropSyncEnabled = $0; controller.saveConfigFlags() }
+                    ))
+                }
+                .font(.system(size: 12.5))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("KEYWORD PRESETS")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(MimirTheme.textMuted)
+                    HStack(spacing: 8) {
+                        TextField("Preset name", text: $controller.presetNameInput)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .frame(width: 150)
+                            .background(MimirTheme.elevatedBg)
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                        TextField("Keywords (comma-separated)", text: $controller.keywordsText)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(MimirTheme.elevatedBg)
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                        Button("Save Preset") {
+                            controller.saveCurrentPreset()
                         }
                         .buttonStyle(.bordered)
                     }
-                    Text(controller.calendarAccessStatus)
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(MimirTheme.textSecondary)
-                }
-                HStack(spacing: 8) {
-                    TextField("https://...ics or /path/to/calendar.ics", text: $controller.calendarIcsInput)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(MimirTheme.elevatedBg)
-                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
-                        .onSubmit {
-                            controller.addCalendarIcsSource()
+                    ForEach(controller.keywordPresets) { preset in
+                        HStack(spacing: 8) {
+                            Text(preset.name)
+                                .font(.system(size: 12, weight: .semibold))
+                            Text(preset.keywords.joined(separator: ", "))
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(MimirTheme.textSecondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Button("Load") {
+                                controller.applyPreset(preset.name)
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(MimirTheme.cyan)
+                            Button("Delete") {
+                                controller.selectedPresetName = preset.name
+                                controller.deleteSelectedPreset()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(MimirTheme.textMuted)
                         }
-                    Button("Add .ics") {
-                        controller.addCalendarIcsSource()
-                    }
-                    .buttonStyle(.bordered)
-                }
-                ForEach(Array(controller.calendarIcsUrls.enumerated()), id: \.offset) { idx, src in
-                    HStack(spacing: 8) {
-                        Text(src)
-                            .font(.system(size: 11.5, design: .monospaced))
-                            .foregroundStyle(MimirTheme.textSecondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Button("Remove") {
-                            controller.removeCalendarIcsSource(at: idx)
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11))
-                        .foregroundStyle(MimirTheme.textMuted)
                     }
                 }
-            }
-            .font(.system(size: 12.5))
-            .foregroundStyle(MimirTheme.textPrimary)
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(MimirTheme.cardBg)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
+                .font(.system(size: 12.5))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text("MCP ASSISTANT AUTO-CONNECT")
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(MimirTheme.textMuted)
-                Text("Register Mimir's local MCP server with Claude Desktop, Claude Code, Cursor, Gemini CLI, Antigravity, and Windsurf.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(MimirTheme.textSecondary)
-                Button("Connect Installed Assistants") {
-                    controller.connectAssistants()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(MimirTheme.azure)
-
-                if !controller.connectReport.isEmpty {
-                    Text(controller.connectReport)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(MimirTheme.ice)
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(MimirTheme.voidBg)
-                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
-                }
-            }
-            .padding(14)
-            .background(MimirTheme.cardBg)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
-
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("LOCAL AI MODELS & UPDATES")
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("CALENDAR")
                         .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                         .foregroundStyle(MimirTheme.textMuted)
-                    Spacer()
-                    Button("Download All") {
-                        controller.fetchModel("all")
+                    HStack(spacing: 10) {
+                        Button("Refresh Calendar") {
+                            controller.refreshCalendarEvents()
+                        }
+                        .buttonStyle(.bordered)
+                        if controller.calendarNeedsGrantButton {
+                            Button("Grant Calendar Access") {
+                                controller.requestCalendarAccess()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        if controller.calendarNeedsSettingsButton {
+                            Button("Open System Settings") {
+                                controller.openCalendarPrivacySettings()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        Text(controller.calendarAccessStatus)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(MimirTheme.textSecondary)
                     }
-                    .disabled(controller.activeModelTaskId != nil)
-                    Button("Refresh") {
-                        controller.refreshModelStatuses()
+                    HStack(spacing: 8) {
+                        TextField("https://...ics or /path/to/calendar.ics", text: $controller.calendarIcsInput)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(MimirTheme.elevatedBg)
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(MimirTheme.hairline, lineWidth: 1))
+                            .onSubmit {
+                                controller.addCalendarIcsSource()
+                            }
+                        Button("Add .ics") {
+                            controller.addCalendarIcsSource()
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    Button("Check for App Updates…") {
-                        controller.checkForUpdates()
+                    ForEach(Array(controller.calendarIcsUrls.enumerated()), id: \.offset) { idx, src in
+                        HStack(spacing: 8) {
+                            Text(src)
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(MimirTheme.textSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Remove") {
+                                controller.removeCalendarIcsSource(at: idx)
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(MimirTheme.textMuted)
+                        }
                     }
                 }
+                .font(.system(size: 12.5))
+                .foregroundStyle(MimirTheme.textPrimary)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
 
-                ForEach(controller.modelStatuses) { model in
-                    HStack(spacing: 10) {
-                        Circle()
-                            .fill(model.installed ? Color.green : MimirTheme.textMuted.opacity(0.4))
-                            .frame(width: 8, height: 8)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.name)
-                                .font(.system(size: 12.5, weight: .medium))
-                                .foregroundStyle(MimirTheme.textPrimary)
-                            Text(
-                                model.installed
-                                    ? String(format: "Installed (%.1f MB)", Double(model.size_bytes) / (1024.0 * 1024.0))
-                                    : "Not installed (\(model.expected_size_label))"
-                            )
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(MimirTheme.textSecondary)
-                        }
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("MCP & SUMMARIES")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(MimirTheme.textMuted)
+                    Text("Register Mimir's local MCP server with Claude Desktop, Claude Code, Cursor, Gemini CLI, Antigravity, and Windsurf. Assistants can read transcripts (`get_transcript`) and save or reuse summaries (`save_summary`, `get_summary`) using your preferred model.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(MimirTheme.textSecondary)
+                    Button("Connect Installed Assistants") {
+                        controller.connectAssistants()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(MimirTheme.azure)
+
+                    if !controller.connectReport.isEmpty {
+                        Text(controller.connectReport)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(MimirTheme.ice)
+                            .textSelection(.enabled)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(MimirTheme.voidBg)
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+                    }
+                }
+                .padding(14)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("LOCAL AI MODELS & UPDATES")
+                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(MimirTheme.textMuted)
                         Spacer()
-                        if controller.activeModelTaskId == model.id || controller.activeModelTaskId == "all" {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                        Button(model.installed ? "Verify" : "Download") {
-                            controller.fetchModel(model.id)
+                        Button("Download All") {
+                            controller.fetchModel("all")
                         }
                         .disabled(controller.activeModelTaskId != nil)
-                        if model.installed {
-                            Button("Delete") {
-                                controller.deleteModel(model.id)
+                        Button("Refresh") {
+                            controller.refreshModelStatuses()
+                        }
+                        Button("Check for App Updates…") {
+                            controller.checkForUpdates()
+                        }
+                    }
+
+                    ForEach(controller.modelStatuses) { model in
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(model.installed ? Color.green : MimirTheme.textMuted.opacity(0.4))
+                                .frame(width: 8, height: 8)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.name)
+                                    .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundStyle(MimirTheme.textPrimary)
+                                Text(
+                                    model.installed
+                                        ? String(format: "Installed (%.1f MB)", Double(model.size_bytes) / (1024.0 * 1024.0))
+                                        : "Not installed (\(model.expected_size_label))"
+                                )
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(MimirTheme.textSecondary)
                             }
-                            .foregroundStyle(Color.red.opacity(0.9))
+                            Spacer()
+                            if controller.activeModelTaskId == model.id || controller.activeModelTaskId == "all" {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Button(model.installed ? "Verify" : "Download") {
+                                controller.fetchModel(model.id)
+                            }
                             .disabled(controller.activeModelTaskId != nil)
+                            if model.installed {
+                                Button("Delete") {
+                                    controller.deleteModel(model.id)
+                                }
+                                .foregroundStyle(Color.red.opacity(0.9))
+                                .disabled(controller.activeModelTaskId != nil)
+                            }
+                        }
+                        .padding(8)
+                        .background(MimirTheme.voidBg)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
+                    }
+
+                    if !controller.updateMessage.isEmpty {
+                        HStack {
+                            Text(controller.updateMessage)
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(MimirTheme.textSecondary)
+                            if let url = controller.updateDownloadURL {
+                                Link("Download Release", destination: url)
+                                    .foregroundStyle(MimirTheme.cyan)
+                            }
                         }
                     }
-                    .padding(8)
-                    .background(MimirTheme.voidBg)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(MimirTheme.hairline, lineWidth: 1))
                 }
-
-                if !controller.updateMessage.isEmpty {
-                    HStack {
-                        Text(controller.updateMessage)
-                            .font(.system(size: 12.5))
-                            .foregroundStyle(MimirTheme.textSecondary)
-                        if let url = controller.updateDownloadURL {
-                            Link("Download Release", destination: url)
-                                .foregroundStyle(MimirTheme.cyan)
-                        }
-                    }
+                .onAppear {
+                    controller.refreshModelStatuses()
                 }
+                .padding(14)
+                .background(MimirTheme.cardBg)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
             }
-            .onAppear {
-                controller.refreshModelStatuses()
-            }
-            .padding(14)
-            .background(MimirTheme.cardBg)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(MimirTheme.hairline, lineWidth: 1))
-
-            Spacer()
+            .padding(16)
         }
-        .padding(16)
     }
 }
 

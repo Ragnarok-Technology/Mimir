@@ -38,10 +38,15 @@ struct MimirActionItem: Identifiable, Decodable, Sendable {
     var id: String { "\(owner ?? "")|\(task)|\(timestamp ?? "")" }
 }
 
+struct MimirUtteranceMeta: Decodable, Sendable {
+    let raw_text: String?
+}
+
 struct MimirSessionJson: Decodable, Sendable {
     let summary_markdown: String?
     let summary_template: String?
     let action_items_json: String?
+    let utterances: [MimirUtteranceMeta]?
 }
 
 struct MimirCalendarEvent: Identifiable, Sendable {
@@ -72,7 +77,6 @@ final class MimirController: ObservableObject {
     @Published var keywordPresets: [MimirKeywordPreset] = []
     @Published var selectedPresetName = ""
     @Published var presetNameInput = ""
-    @Published var autoSummarize = true
     @Published var dropSyncEnabled = false
     @Published var liveLines: [String] = []
     @Published var sessions: [MimirSessionSummary] = []
@@ -80,12 +84,11 @@ final class MimirController: ObservableObject {
     @Published var selectedSessionId: String?
     @Published var selectedTranscript = ""
     @Published var selectedTitleEdit = ""
+    @Published var selectedHasCleaned = false
+    @Published var selectedHasSummary = false
     @Published var selectedSummaryMarkdown = ""
-    @Published var selectedSummaryTemplate = "general"
+    @Published var selectedSummaryTemplate = ""
     @Published var selectedActionItems: [MimirActionItem] = []
-    @Published var isSummarizingSession = false
-    @Published var summarizeDone = 0
-    @Published var summarizeTotal = 0
     @Published var upcomingEvents: [MimirCalendarEvent] = []
     @Published var calendarAccessStatus = "Checking calendar…"
     @Published var calendarNeedsSettingsButton = false
@@ -520,9 +523,18 @@ final class MimirController: ObservableObject {
             if let data = jsonOut.data(using: .utf8),
                let detail = try? JSONDecoder().decode(MimirSessionJson.self, from: data)
             {
-                self.selectedSummaryMarkdown = detail.summary_markdown ?? ""
-                if let tmpl = detail.summary_template, !tmpl.isEmpty {
-                    self.selectedSummaryTemplate = tmpl
+                let hasCleaned = detail.utterances?.contains(where: { $0.raw_text != nil }) ?? false
+                let summaryText = detail.summary_markdown?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let hasSummary = !summaryText.isEmpty
+                self.selectedHasCleaned = hasCleaned
+                self.selectedHasSummary = hasSummary
+                self.selectedSummaryMarkdown = summaryText
+                self.selectedSummaryTemplate = detail.summary_template ?? ""
+                if !hasCleaned && (self.transcriptViewMode == "raw" || self.transcriptViewMode == "diff") {
+                    self.transcriptViewMode = "cleaned"
+                }
+                if !hasSummary && self.transcriptViewMode == "summary" {
+                    self.transcriptViewMode = "cleaned"
                 }
                 if let rawItems = detail.action_items_json,
                    let itemsData = rawItems.data(using: .utf8),
@@ -532,6 +544,12 @@ final class MimirController: ObservableObject {
                 } else {
                     self.selectedActionItems = []
                 }
+            } else {
+                self.selectedHasCleaned = false
+                self.selectedHasSummary = false
+                self.selectedSummaryMarkdown = ""
+                self.selectedSummaryTemplate = ""
+                self.selectedActionItems = []
             }
         }
     }
@@ -755,58 +773,7 @@ final class MimirController: ObservableObject {
         }
     }
 
-    // MARK: - Summarization, Presets & Config
-
-    func summarizeSelectedSession() {
-        guard let sid = selectedSessionId else { return }
-        isSummarizingSession = true
-        summarizeDone = 0
-        summarizeTotal = 0
-        let tmpl = selectedSummaryTemplate
-        statusMessage = "Summarizing session with Qwen 2.5 0.5B…"
-        let bin = mimirBinaryURL
-        Task {
-            let output: String = await withCheckedContinuation { cont in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let proc = Process()
-                    proc.executableURL = bin
-                    proc.arguments = ["summarize", sid, "--template", tmpl, "--progress"]
-                    let outPipe = Pipe()
-                    let errPipe = Pipe()
-                    proc.standardOutput = outPipe
-                    proc.standardError = errPipe
-
-                    errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                        let data = handle.availableData
-                        guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                        for line in chunk.components(separatedBy: .newlines) where line.hasPrefix("PROGRESS:") {
-                            let parts = line.split(separator: ":")
-                            if parts.count == 3, let d = Int(parts[1]), let t = Int(parts[2]) {
-                                Task { @MainActor [weak self] in
-                                    self?.summarizeDone = d
-                                    self?.summarizeTotal = t
-                                }
-                            }
-                        }
-                    }
-
-                    try? proc.run()
-                    proc.waitUntilExit()
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                    cont.resume(returning: String(data: outData, encoding: .utf8) ?? "")
-                }
-            }
-            self.isSummarizingSession = false
-            self.transcriptViewMode = "summary"
-            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                self.statusMessage = "Summarized session (\(tmpl))"
-            }
-            self.refreshSessions()
-            self.selectSession(sid)
-        }
-    }
+    // MARK: - Presets & Config
 
     func refreshPresets() {
         Task {
@@ -866,14 +833,8 @@ final class MimirController: ObservableObject {
               let data = try? Data(contentsOf: url),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
-        if let autoSum = dict["auto_summarize"] as? Bool {
-            self.autoSummarize = autoSum
-        }
         if let dropSync = dict["drop_sync_enabled"] as? Bool {
             self.dropSyncEnabled = dropSync
-        }
-        if let tmpl = dict["default_summary_template"] as? String, !tmpl.isEmpty {
-            self.selectedSummaryTemplate = tmpl
         }
         if let ics = dict["calendar_ics_urls"] as? [String] {
             self.calendarIcsUrls = ics
@@ -890,9 +851,7 @@ final class MimirController: ObservableObject {
         {
             dict = existing
         }
-        dict["auto_summarize"] = autoSummarize
         dict["drop_sync_enabled"] = dropSyncEnabled
-        dict["default_summary_template"] = selectedSummaryTemplate
         dict["calendar_ics_urls"] = calendarIcsUrls
         if let encoded = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
             try? encoded.write(to: url)
