@@ -16,7 +16,8 @@ use mimir_store::cleanup::{
     basic_heuristic_cleanup, build_qwen_cleanup_prompt_with_context, sanitize_cleanup_edit,
 };
 use mimir_store::{
-    SearchHit, SessionStore, SessionSummary, encrypt_bytes_at_rest, ensure_private_dir,
+    SearchHit, SessionStore, SessionSummary, decrypt_bytes_at_rest, encrypt_bytes_at_rest,
+    ensure_private_dir,
     export::{TranscriptView, render_markdown_with_view},
     sync_session_to_drop_dir_if_enabled,
 };
@@ -316,7 +317,7 @@ impl MimirDesktopApp {
                 let (audio_tx, audio_rx) = mpsc::channel();
                 #[cfg(target_os = "macos")]
                 let mut sc_tap_child: Option<std::process::Child> = if cfg.capture_system_audio {
-                    spawn_macos_sc_tap(audio_tx.clone(), stop.clone())
+                    spawn_macos_sc_tap(audio_tx.clone(), stop.clone(), tx_ui.clone())
                 } else {
                     None
                 };
@@ -735,6 +736,50 @@ impl eframe::App for MimirDesktopApp {
                                 self.tab = Tab::Live;
                             }
                         }
+                        if ui.button("Copy Latest").clicked() {
+                            if let Ok(store) = SessionStore::open(&self.cfg.data_dir)
+                                && let Ok(list) = store.list_sessions_filtered(1, false)
+                                && let Some(latest) = list.first()
+                                && let Ok(Some(sess)) = store.get_session(latest.id)
+                            {
+                                let md = render_markdown_with_view(&sess, TranscriptView::Cleaned);
+                                ctx.copy_text(md);
+                                self.status_line = format!("Copied '{}' to clipboard.", sess.title);
+                            } else {
+                                self.status_line = "No sessions available to copy.".into();
+                            }
+                        }
+                        if ui.button("Connect AI (MCP)").clicked() {
+                            let home = dirs::home_dir().unwrap_or_else(|| self.cfg.data_dir.clone());
+                            let mimir_bin = std::env::current_exe()
+                                .ok()
+                                .and_then(|exe| {
+                                    let dir = exe.parent()?;
+                                    let bundled = dir.join("mimir-cli");
+                                    if bundled.is_file() {
+                                        Some(bundled)
+                                    } else {
+                                        let sibling = dir.join("mimir");
+                                        if sibling.is_file() { Some(sibling) } else { None }
+                                    }
+                                })
+                                .unwrap_or_else(|| std::path::PathBuf::from("mimir"));
+                            match connect_detected_assistants(&home, &mimir_bin, false) {
+                                Ok(outcomes) if outcomes.is_empty() => {
+                                    self.status_line = "No supported AI assistant configs found.".into();
+                                }
+                                Ok(outcomes) => {
+                                    let names: Vec<String> = outcomes
+                                        .into_iter()
+                                        .map(|o| format!("{} ({})", o.name, o.status))
+                                        .collect();
+                                    self.status_line = format!("MCP connected: {}", names.join(", "));
+                                }
+                                Err(e) => {
+                                    self.status_line = format!("MCP connect failed: {e}");
+                                }
+                            }
+                        }
                     });
                 });
             });
@@ -1065,6 +1110,37 @@ impl eframe::App for MimirDesktopApp {
                                 self.status_line = format!("Reverted {n} utterance(s) to raw text.");
                                 self.load_session(sel_id);
                             }
+                        }
+                        let audio_dir = self.cfg.data_dir.join("audio");
+                        let has_audio = ["mic", "sys"].iter().any(|ch| {
+                            audio_dir.join(format!("{sel_id}_{ch}.wav")).is_file()
+                                || audio_dir.join(format!("{sel_id}_{ch}.wav.enc")).is_file()
+                        });
+                        if has_audio && ui.button("Export WAV").clicked() {
+                            let export_dir = self.cfg.data_dir.join("exports");
+                            let _ = std::fs::create_dir_all(&export_dir);
+                            let mut exported = 0usize;
+                            for ch in ["mic", "sys"] {
+                                let plain = audio_dir.join(format!("{sel_id}_{ch}.wav"));
+                                let enc = audio_dir.join(format!("{sel_id}_{ch}.wav.enc"));
+                                let out = export_dir.join(format!("{sel_id}_{ch}.wav"));
+                                if plain.is_file() {
+                                    if std::fs::copy(&plain, &out).is_ok() {
+                                        exported += 1;
+                                    }
+                                } else if enc.is_file()
+                                    && let Ok(raw) = std::fs::read(&enc)
+                                    && let Ok(dec) = decrypt_bytes_at_rest(&self.cfg.data_dir, &raw)
+                                    && std::fs::write(&out, dec).is_ok()
+                                {
+                                    exported += 1;
+                                }
+                            }
+                            self.status_line = if exported > 0 {
+                                format!("Exported {exported} WAV file(s) to {}", export_dir.display())
+                            } else {
+                                "Failed to export WAV archive.".into()
+                            };
                         }
                         if self.selected_has_cleaned || self.selected_has_summary {
                             let primary_lbl = if self.selected_has_cleaned { "Cleaned" } else { "Transcript" };
@@ -1864,8 +1940,9 @@ fn build_inline_markdown_job(
 fn spawn_macos_sc_tap(
     tx: mpsc::Sender<mimir_audio::CapturedFrame>,
     stop_flag: Arc<AtomicBool>,
+    tx_ui: mpsc::Sender<UiEvent>,
 ) -> Option<std::process::Child> {
-    use std::io::Read;
+    use std::io::{BufRead, BufReader, Read};
     use std::process::{Command, Stdio};
 
     let tap_bin = std::env::current_exe()
@@ -1874,12 +1951,33 @@ fn spawn_macos_sc_tap(
         .filter(|p| p.is_file())
         .unwrap_or_else(|| std::path::PathBuf::from("mimir-sc-tap"));
 
-    let mut child = Command::new(tap_bin)
+    let mut child = match Command::new(&tap_bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx_ui.send(UiEvent::Status(format!(
+                "System audio tap unavailable ({}): {e}",
+                tap_bin.display()
+            )));
+            return None;
+        }
+    };
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx_err = tx_ui.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let _ = tx_err.send(UiEvent::Status(trimmed.to_string()));
+                }
+            }
+        });
+    }
 
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();

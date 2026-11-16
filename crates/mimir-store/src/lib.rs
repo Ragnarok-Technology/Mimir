@@ -1134,6 +1134,26 @@ impl SessionStore {
             }
         }
 
+        // 5. Encrypt plaintext WAV archives in audio/
+        let audio_dir = self.data_dir.join("audio");
+        if let Ok(entries) = fs::read_dir(&audio_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("wav")
+                    && let Ok(raw) = fs::read(&path)
+                {
+                    let enc = encrypt_bytes_at_rest(&self.data_dir, &raw)?;
+                    let mut enc_name = path.file_name().unwrap_or_default().to_os_string();
+                    enc_name.push(".enc");
+                    let enc_path = audio_dir.join(enc_name);
+                    atomic_write(&enc_path, &enc)?;
+                    let _ = restrict_file_permissions(&enc_path);
+                    let _ = fs::remove_file(&path);
+                    migrated += 1;
+                }
+            }
+        }
+
         Ok(migrated)
     }
 }
