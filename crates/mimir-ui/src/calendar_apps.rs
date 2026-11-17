@@ -34,20 +34,18 @@ pub fn fetch_all_calendar_events(
     let now_ts = now.timestamp();
     let mut all_events: Vec<CalendarEvent> = Vec::new();
     let mut statuses: Vec<CalendarSourceStatus> = Vec::new();
-    let mut apple_status: Option<String> = None;
-
-    // 1. OS-native calendar apps
     #[cfg(target_os = "macos")]
-    {
+    let apple_status = {
         let (evs, st, raw_status) = fetch_apple_calendar(request_macos_access);
-        apple_status = Some(raw_status);
         statuses.push(st);
         all_events.extend(evs);
-    }
+        Some(raw_status)
+    };
     #[cfg(not(target_os = "macos"))]
-    {
+    let apple_status: Option<String> = {
         let _ = request_macos_access;
-    }
+        None
+    };
 
     #[cfg(target_os = "windows")]
     {
@@ -716,7 +714,7 @@ fn query_thunderbird_sqlite(
             }
         }
 
-        let mut attendees = Vec::new();
+        let mut attendees: Vec<String> = Vec::new();
         if let Ok(mut att_stmt) = conn.prepare(
             "SELECT common_name, attendee_id FROM cal_attendees WHERE item_id = ?1",
         ) {
@@ -737,7 +735,10 @@ fn query_thunderbird_sqlite(
                             .unwrap_or(att_id.trim())
                             .to_string()
                     };
-                    if !label.is_empty() && !attendees.iter().any(|a| a.eq_ignore_ascii_case(&label))
+                    if !label.is_empty()
+                        && !attendees
+                            .iter()
+                            .any(|a: &String| a.eq_ignore_ascii_case(&label))
                     {
                         attendees.push(label);
                     }
