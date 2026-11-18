@@ -73,7 +73,7 @@ cat << 'PLIST' > "$CONTENTS_DIR/Info.plist"
 </plist>
 PLIST
 
-VERSION="${MIMIR_VERSION:-0.2.0}"
+VERSION="${MIMIR_VERSION:-0.0.2}"
 VERSION="${VERSION#v}"
 sed -i '' "s/__MIMIR_VERSION__/${VERSION}/g" "$CONTENTS_DIR/Info.plist"
 
