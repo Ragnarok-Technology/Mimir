@@ -15,15 +15,6 @@ pub const WHISTLE_SAMPLE_RATE: u32 = 16_000;
 /// Supported languages for base `whistle.cact`.
 pub const WHISTLE_LANGUAGES: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
 
-/// Supported built-in summary templates.
-pub const SUMMARY_TEMPLATES: [&str; 5] = [
-    "general",
-    "1on1",
-    "standup",
-    "sales_discovery",
-    "technical_review",
-];
-
 #[derive(Debug, Error)]
 pub enum MimirError {
     #[error("audio capture error: {0}")]
@@ -197,16 +188,32 @@ pub enum AudioRetention {
     ArchiveWav,
 }
 
-fn default_true() -> bool {
-    true
+/// CalDAV calendar account (iCloud, Fastmail, Nextcloud, Radicale, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CalDavAccount {
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
 }
 
-fn default_summary_template() -> String {
-    "general".to_string()
+/// OAuth2 calendar account (Google Calendar or Microsoft 365 / Outlook Graph).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OAuthCalendarAccount {
+    /// `"google"` or `"microsoft"`.
+    pub provider: String,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
 /// Runtime configuration for Mimir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MimirConfig {
     pub data_dir: PathBuf,
     pub drop_dir: Option<PathBuf>,
@@ -217,22 +224,16 @@ pub struct MimirConfig {
     pub keywords: Vec<String>,
     pub audio_retention: AudioRetention,
     pub http_bind_addr: String,
-    #[serde(default)]
+    pub capture_system_audio: bool,
+    pub diarize_mic: bool,
     pub auto_detect_calls: bool,
-    #[serde(default)]
     pub encrypt_at_rest: bool,
-    #[serde(default)]
     pub cleanup_enabled: bool,
-    #[serde(default = "default_true")]
-    pub auto_summarize: bool,
-    #[serde(default = "default_summary_template")]
-    pub default_summary_template: String,
-    #[serde(default)]
     pub keyword_presets: Vec<KeywordPreset>,
-    #[serde(default)]
     pub drop_sync_enabled: bool,
-    #[serde(default)]
     pub calendar_ics_urls: Vec<String>,
+    pub caldav_accounts: Vec<CalDavAccount>,
+    pub oauth_calendar_accounts: Vec<OAuthCalendarAccount>,
 }
 
 impl Default for MimirConfig {
@@ -250,14 +251,16 @@ impl Default for MimirConfig {
             keywords: Vec::new(),
             audio_retention: AudioRetention::Ephemeral,
             http_bind_addr: "127.0.0.1:7331".to_string(),
+            capture_system_audio: true,
+            diarize_mic: false,
             auto_detect_calls: false,
             encrypt_at_rest: false,
             cleanup_enabled: false,
-            auto_summarize: true,
-            default_summary_template: default_summary_template(),
             keyword_presets: Vec::new(),
             drop_sync_enabled: false,
             calendar_ics_urls: Vec::new(),
+            caldav_accounts: Vec::new(),
+            oauth_calendar_accounts: Vec::new(),
         }
     }
 }

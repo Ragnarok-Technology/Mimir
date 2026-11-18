@@ -2,7 +2,6 @@
 
 pub mod cleanup;
 pub mod export;
-pub mod summarize;
 
 use chrono::{DateTime, Utc};
 use mimir_core::{
@@ -27,6 +26,8 @@ pub struct SessionSummary {
     pub utterance_count: usize,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub has_summary: bool,
 }
 
 /// Full-text search hit across stored sessions.
@@ -51,15 +52,28 @@ pub struct StoredVoiceprint {
 /// Local SQLite + JSONL persistence layer.
 pub struct SessionStore {
     conn: Connection,
+    data_dir: PathBuf,
     sessions_dir: PathBuf,
+    encrypt_at_rest: bool,
 }
 
 impl SessionStore {
     /// Opens (or initializes) the SQLite FTS5 database and JSONL WAL directory under `data_dir`.
+    /// Reads `encrypt_at_rest` from `data_dir/config.json` if present (defaulting to `false`).
     pub fn open(data_dir: &Path) -> Result<Self> {
-        fs::create_dir_all(data_dir)?;
+        let cfg_path = MimirConfig::config_path(data_dir);
+        let encrypt_at_rest = fs::read_to_string(&cfg_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<MimirConfig>(&raw).ok())
+            .is_some_and(|c| c.encrypt_at_rest);
+        Self::open_with_encryption(data_dir, encrypt_at_rest)
+    }
+
+    /// Opens (or initializes) the store with an explicit `encrypt_at_rest` flag.
+    pub fn open_with_encryption(data_dir: &Path, encrypt_at_rest: bool) -> Result<Self> {
+        ensure_private_dir(data_dir)?;
         let sessions_dir = data_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir)?;
+        ensure_private_dir(&sessions_dir)?;
 
         let db_path = data_dir.join("mimir.db");
         let conn = Connection::open(&db_path)
@@ -151,7 +165,39 @@ impl SessionStore {
             let _ = conn.execute(&sql, []);
         }
 
-        Ok(Self { conn, sessions_dir })
+        Ok(Self {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+            sessions_dir,
+            encrypt_at_rest,
+        })
+    }
+
+    fn enc_str(&self, plain: &str) -> Result<String> {
+        if !self.encrypt_at_rest || plain.starts_with("enc:v1:") {
+            return Ok(plain.to_string());
+        }
+        let blob = encrypt_bytes_at_rest(&self.data_dir, plain.as_bytes())?;
+        Ok(format!("enc:v1:{}", hex::encode(blob)))
+    }
+
+    fn enc_opt(&self, plain: Option<&str>) -> Result<Option<String>> {
+        plain.map(|s| self.enc_str(s)).transpose()
+    }
+
+    fn dec_str(&self, stored: &str) -> Result<String> {
+        let Some(hex_payload) = stored.strip_prefix("enc:v1:") else {
+            return Ok(stored.to_string());
+        };
+        let blob = hex::decode(hex_payload)
+            .map_err(|e| MimirError::Storage(format!("invalid encrypted hex payload: {e}")))?;
+        let plain = decrypt_bytes_at_rest(&self.data_dir, &blob)?;
+        String::from_utf8(plain)
+            .map_err(|e| MimirError::Storage(format!("invalid UTF-8 in decrypted payload: {e}")))
+    }
+
+    fn dec_opt(&self, stored: Option<String>) -> Result<Option<String>> {
+        stored.map(|s| self.dec_str(&s)).transpose()
     }
 
     /// Creates a new session record and registers its initial speakers.
@@ -171,17 +217,17 @@ impl SessionStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     session.id.to_string(),
-                    session.title,
+                    self.enc_opt(session.title.as_deref())?,
                     session.started_at.to_rfc3339(),
                     session.ended_at.map(|d| d.to_rfc3339()),
                     langs,
-                    kws,
-                    session.summary_markdown,
+                    self.enc_str(&kws)?,
+                    self.enc_opt(session.summary_markdown.as_deref())?,
                     session.summary_template,
-                    session.action_items_json,
-                    session.calendar_event_uid,
-                    session.meeting_url,
-                    session.attendees_json,
+                    self.enc_opt(session.action_items_json.as_deref())?,
+                    self.enc_opt(session.calendar_event_uid.as_deref())?,
+                    self.enc_opt(session.meeting_url.as_deref())?,
+                    self.enc_opt(session.attendees_json.as_deref())?,
                 ],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
@@ -199,6 +245,7 @@ impl SessionStore {
             ChannelId::Mic => "mic",
             ChannelId::System => "system",
         };
+        let label = self.enc_str(&speaker.label)?;
         self.conn
             .execute(
                 "INSERT INTO speakers (session_id, id, label, channel, is_host)
@@ -207,7 +254,7 @@ impl SessionStore {
                 params![
                     session_id.to_string(),
                     speaker.id,
-                    speaker.label,
+                    label,
                     ch,
                     i32::from(speaker.is_host),
                 ],
@@ -218,11 +265,12 @@ impl SessionStore {
 
     /// Renames a speaker in SQLite; returns `true` if updated.
     pub fn rename_speaker(&self, session_id: Uuid, speaker_id: &str, new_label: &str) -> Result<bool> {
+        let label = self.enc_str(new_label)?;
         let rows = self
             .conn
             .execute(
                 "UPDATE speakers SET label = ?1 WHERE session_id = ?2 AND id = ?3",
-                params![new_label, session_id.to_string(), speaker_id],
+                params![label, session_id.to_string(), speaker_id],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
         Ok(rows > 0)
@@ -249,20 +297,21 @@ impl SessionStore {
                     ch,
                     utterance.start_ms as i64,
                     utterance.end_ms as i64,
-                    utterance.text,
-                    utterance.raw_text,
+                    self.enc_str(&utterance.text)?,
+                    self.enc_opt(utterance.raw_text.as_deref())?,
                     utterance.language,
                     utterance.avg_confidence,
-                    words_json,
+                    self.enc_str(&words_json)?,
                 ],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
 
+        let fts_text = if self.encrypt_at_rest { "" } else { &utterance.text };
         self.conn
             .execute(
                 "INSERT INTO utterances_fts (text, utterance_id, session_id) VALUES (?1, ?2, ?3)",
                 params![
-                    utterance.text,
+                    fts_text,
                     utterance.id.to_string(),
                     session_id.to_string()
                 ],
@@ -274,9 +323,11 @@ impl SessionStore {
             .create(true)
             .append(true)
             .open(&wal_path)?;
+        let _ = restrict_file_permissions(&wal_path);
         let line = serde_json::to_string(utterance)
             .map_err(|e| MimirError::Storage(e.to_string()))?;
-        writeln!(file, "{line}")?;
+        let out_line = self.enc_str(&line)?;
+        writeln!(file, "{out_line}")?;
         file.flush()?;
 
         Ok(())
@@ -312,14 +363,16 @@ impl SessionStore {
         include_archived: bool,
     ) -> Result<Vec<SessionSummary>> {
         let sql = if include_archived {
-            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived
+            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived,
+                    (s.summary_markdown IS NOT NULL AND TRIM(s.summary_markdown) != '') as has_sum
              FROM sessions s
              LEFT JOIN utterances u ON u.session_id = s.id
              GROUP BY s.id
              ORDER BY s.started_at DESC
              LIMIT ?1"
         } else {
-            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived
+            "SELECT s.id, s.title, s.started_at, s.ended_at, COUNT(u.id) as cnt, s.archived,
+                    (s.summary_markdown IS NOT NULL AND TRIM(s.summary_markdown) != '') as has_sum
              FROM sessions s
              LEFT JOIN utterances u ON u.session_id = s.id
              WHERE s.archived = 0
@@ -340,18 +393,19 @@ impl SessionStore {
                 let ended_str: Option<String> = row.get(3)?;
                 let count: i64 = row.get(4)?;
                 let archived: i64 = row.get(5)?;
-                Ok((id_str, title, started_str, ended_str, count, archived != 0))
+                let has_summary: i64 = row.get(6)?;
+                Ok((id_str, title, started_str, ended_str, count, archived != 0, has_summary != 0))
             })
             .map_err(|e| MimirError::Storage(e.to_string()))?;
 
         let mut out = Vec::new();
         for r in rows {
-            let (id_str, title, started_str, ended_str, count, archived) =
+            let (id_str, title, started_str, ended_str, count, archived, has_summary) =
                 r.map_err(|e| MimirError::Storage(e.to_string()))?;
             out.push(SessionSummary {
                 id: Uuid::parse_str(&id_str)
                     .map_err(|e| MimirError::Storage(e.to_string()))?,
-                title,
+                title: self.dec_opt(title)?,
                 started_at: DateTime::parse_from_rfc3339(&started_str)
                     .map_err(|e| MimirError::Storage(e.to_string()))?
                     .with_timezone(&Utc),
@@ -361,6 +415,7 @@ impl SessionStore {
                     .map_err(|e| MimirError::Storage(e.to_string()))?,
                 utterance_count: count.max(0) as usize,
                 archived,
+                has_summary,
             });
         }
         Ok(out)
@@ -370,11 +425,12 @@ impl SessionStore {
     pub fn rename_session(&self, session_id: Uuid, new_title: &str) -> Result<bool> {
         let trimmed = new_title.trim();
         let title_val: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+        let enc_title = self.enc_opt(title_val)?;
         let rows = self
             .conn
             .execute(
                 "UPDATE sessions SET title = ?1 WHERE id = ?2",
-                params![title_val, session_id.to_string()],
+                params![enc_title, session_id.to_string()],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
         Ok(rows > 0)
@@ -400,16 +456,19 @@ impl SessionStore {
         raw_text: Option<&str>,
     ) -> Result<()> {
         let uid = utterance_id.to_string();
+        let enc_text = self.enc_str(new_text)?;
+        let enc_raw = self.enc_opt(raw_text)?;
         self.conn
             .execute(
                 "UPDATE utterances SET text = ?1, raw_text = COALESCE(raw_text, ?2) WHERE id = ?3",
-                params![new_text, raw_text, &uid],
+                params![enc_text, enc_raw, &uid],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
+        let fts_text = if self.encrypt_at_rest { "" } else { new_text };
         self.conn
             .execute(
                 "UPDATE utterances_fts SET text = ?1 WHERE utterance_id = ?2",
-                params![new_text, &uid],
+                params![fts_text, &uid],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
         Ok(())
@@ -490,16 +549,18 @@ impl SessionStore {
         for utt in &session.utterances {
             if let Some(raw) = &utt.raw_text {
                 let uid = utt.id.to_string();
+                let enc_raw = self.enc_str(raw)?;
                 self.conn
                     .execute(
                         "UPDATE utterances SET text = ?1, raw_text = NULL WHERE id = ?2",
-                        params![raw, &uid],
+                        params![enc_raw, &uid],
                     )
                     .map_err(|e| MimirError::Storage(e.to_string()))?;
+                let fts_text = if self.encrypt_at_rest { "" } else { raw.as_str() };
                 self.conn
                     .execute(
                         "UPDATE utterances_fts SET text = ?1 WHERE utterance_id = ?2",
-                        params![raw, &uid],
+                        params![fts_text, &uid],
                     )
                     .map_err(|e| MimirError::Storage(e.to_string()))?;
                 reverted += 1;
@@ -577,6 +638,8 @@ impl SessionStore {
         summary_template: Option<&str>,
         action_items_json: Option<&str>,
     ) -> Result<bool> {
+        let enc_md = self.enc_opt(summary_markdown)?;
+        let enc_actions = self.enc_opt(action_items_json)?;
         let rows = self
             .conn
             .execute(
@@ -584,9 +647,9 @@ impl SessionStore {
                  SET summary_markdown = ?1, summary_template = ?2, action_items_json = ?3
                  WHERE id = ?4",
                 params![
-                    summary_markdown,
+                    enc_md,
                     summary_template,
-                    action_items_json,
+                    enc_actions,
                     session_id.to_string()
                 ],
             )
@@ -602,6 +665,9 @@ impl SessionStore {
         meeting_url: Option<&str>,
         attendees_json: Option<&str>,
     ) -> Result<bool> {
+        let enc_uid = self.enc_opt(calendar_event_uid)?;
+        let enc_url = self.enc_opt(meeting_url)?;
+        let enc_att = self.enc_opt(attendees_json)?;
         let rows = self
             .conn
             .execute(
@@ -609,129 +675,14 @@ impl SessionStore {
                  SET calendar_event_uid = ?1, meeting_url = ?2, attendees_json = ?3
                  WHERE id = ?4",
                 params![
-                    calendar_event_uid,
-                    meeting_url,
-                    attendees_json,
+                    enc_uid,
+                    enc_url,
+                    enc_att,
                     session_id.to_string()
                 ],
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
         Ok(rows > 0)
-    }
-
-    /// Runs local map-reduce summarization, action-item extraction, and conditional auto-titling
-    /// using the provided `complete(system, user, max_new_tokens)` callback (e.g. `QwenCleanupModel::complete`).
-    pub fn summarize_session_with_progress<F, P>(
-        &self,
-        session_id: Uuid,
-        template: &str,
-        mut complete: F,
-        mut on_progress: P,
-    ) -> Result<summarize::SessionSummaryResult>
-    where
-        F: FnMut(&str, &str, usize) -> Result<String>,
-        P: FnMut(usize, usize),
-    {
-        let Some(session) = self.get_session(session_id)? else {
-            return Err(MimirError::Storage(format!("session {session_id} not found")));
-        };
-
-        let norm_template = summarize::normalize_template_name(template).to_string();
-        let lines = summarize::format_transcript_lines(&session);
-        if lines.is_empty() {
-            let empty_json = "[]".to_string();
-            self.update_session_summary(
-                session_id,
-                Some("No spoken utterances recorded in this session."),
-                Some(&norm_template),
-                Some(&empty_json),
-            )?;
-            on_progress(1, 1);
-            return Ok(summarize::SessionSummaryResult {
-                summary_markdown: "No spoken utterances recorded in this session.".to_string(),
-                summary_template: norm_template,
-                action_items: Vec::new(),
-                action_items_json: empty_json,
-                auto_title: None,
-            });
-        }
-
-        let chunks = summarize::chunk_transcript_lines(&lines, summarize::DEFAULT_SUMMARY_CHUNK_CHARS);
-        let map_steps = if chunks.len() > 1 { chunks.len() } else { 0 };
-        let needs_title = summarize::is_default_or_timestamped_title(session.title.as_deref());
-        let total_steps = map_steps + 2 + usize::from(needs_title);
-        let mut done = 0usize;
-        on_progress(done, total_steps);
-
-        let combined_notes = if chunks.len() > 1 {
-            let mut partials = Vec::with_capacity(chunks.len());
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let (sys, usr) = summarize::build_chunk_map_prompt(chunk, idx, chunks.len());
-                let note = complete(&sys, &usr, 220)?;
-                if !note.trim().is_empty() {
-                    partials.push(note.trim().to_string());
-                }
-                done += 1;
-                on_progress(done, total_steps);
-            }
-            partials.join("\n\n")
-        } else {
-            chunks[0].clone()
-        };
-
-        let context_hint = session.title.as_deref().filter(|t| !summarize::is_default_or_timestamped_title(Some(t)));
-        let (sum_sys, sum_usr) =
-            summarize::build_summary_reduce_prompt(&combined_notes, &norm_template, context_hint);
-        let summary_markdown = complete(&sum_sys, &sum_usr, 420)?.trim().to_string();
-        done += 1;
-        on_progress(done, total_steps);
-
-        let speaker_labels: Vec<String> = session
-            .speakers
-            .values()
-            .map(|s| s.label.clone())
-            .collect();
-        let (act_sys, act_usr) = summarize::build_action_items_prompt(&combined_notes, &speaker_labels);
-        let raw_actions = complete(&act_sys, &act_usr, 320)?;
-        let action_items = summarize::parse_action_items_response(&raw_actions);
-        let action_items_json = serde_json::to_string(&action_items)
-            .map_err(|e| MimirError::Storage(e.to_string()))?;
-        done += 1;
-        on_progress(done, total_steps);
-
-        let auto_title = if needs_title {
-            let title_input = if summary_markdown.is_empty() {
-                combined_notes.as_str()
-            } else {
-                summary_markdown.as_str()
-            };
-            let (title_sys, title_usr) = summarize::build_auto_title_prompt(title_input);
-            let raw_title = complete(&title_sys, &title_usr, 32)?;
-            let sanitized = summarize::sanitize_auto_title(&raw_title);
-            if let Some(ref t) = sanitized {
-                let _ = self.rename_session(session_id, t);
-            }
-            done += 1;
-            on_progress(done, total_steps);
-            sanitized
-        } else {
-            None
-        };
-
-        self.update_session_summary(
-            session_id,
-            Some(&summary_markdown),
-            Some(&norm_template),
-            Some(&action_items_json),
-        )?;
-
-        Ok(summarize::SessionSummaryResult {
-            summary_markdown,
-            summary_template: norm_template,
-            action_items,
-            action_items_json,
-            auto_title,
-        })
     }
 
     /// Loads a full `Session` (including speakers and chronologically ordered utterances).
@@ -795,6 +746,14 @@ impl SessionStore {
             return Ok(None);
         };
 
+        let title = self.dec_opt(title)?;
+        let kws_json = self.dec_str(&kws_json)?;
+        let summary_markdown = self.dec_opt(summary_markdown)?;
+        let action_items_json = self.dec_opt(action_items_json)?;
+        let calendar_event_uid = self.dec_opt(calendar_event_uid)?;
+        let meeting_url = self.dec_opt(meeting_url)?;
+        let attendees_json = self.dec_opt(attendees_json)?;
+
         let mut speakers = HashMap::new();
         let mut spk_stmt = self
             .conn
@@ -815,6 +774,7 @@ impl SessionStore {
         for sr in spk_rows {
             let (id, label, ch_str, is_host) =
                 sr.map_err(|e| MimirError::Storage(e.to_string()))?;
+            let label = self.dec_str(&label)?;
             let channel = if ch_str == "mic" {
                 ChannelId::Mic
             } else {
@@ -859,6 +819,9 @@ impl SessionStore {
         for ur in utt_rows {
             let (uid, speaker_id, ch_str, start_ms, end_ms, text, raw_text, language, avg_confidence, words_json) =
                 ur.map_err(|e| MimirError::Storage(e.to_string()))?;
+            let text = self.dec_str(&text)?;
+            let raw_text = self.dec_opt(raw_text)?;
+            let words_json = self.dec_str(&words_json)?;
             let words: Vec<WordToken> = serde_json::from_str(&words_json).unwrap_or_default();
             utterances.push(Utterance {
                 id: Uuid::parse_str(&uid).map_err(|e| MimirError::Storage(e.to_string()))?,
@@ -910,29 +873,75 @@ impl SessionStore {
         }
     }
 
-    /// Full-text searches across all stored utterances using SQLite FTS5.
+    /// Full-text searches across all stored utterances (SQLite FTS5 when unencrypted,
+    /// decrypted in-memory scan when encrypted at rest).
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
 
+        let mut hits = Vec::new();
+        if !self.encrypt_at_rest {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT u.session_id, s.title, u.id, u.speaker_id, COALESCE(sp.label, u.speaker_id), u.start_ms, u.text
+                     FROM utterances_fts f
+                     JOIN utterances u ON u.id = f.utterance_id
+                     JOIN sessions s ON s.id = u.session_id
+                     LEFT JOIN speakers sp ON sp.session_id = u.session_id AND sp.id = u.speaker_id
+                     WHERE utterances_fts MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2",
+                )
+                .map_err(|e| MimirError::Storage(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![trimmed, limit as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                })
+                .map_err(|e| MimirError::Storage(e.to_string()))?;
+
+            for r in rows {
+                let (sid, title, uid, spk_id, spk_label, start_ms, text) =
+                    r.map_err(|e| MimirError::Storage(e.to_string()))?;
+                hits.push(SearchHit {
+                    session_id: Uuid::parse_str(&sid).map_err(|e| MimirError::Storage(e.to_string()))?,
+                    session_title: self.dec_opt(title)?,
+                    utterance_id: Uuid::parse_str(&uid).map_err(|e| MimirError::Storage(e.to_string()))?,
+                    speaker_id: spk_id,
+                    speaker_label: self.dec_str(&spk_label)?,
+                    start_ms: start_ms.max(0) as u64,
+                    text: self.dec_str(&text)?,
+                });
+            }
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+
+        let needle = trimmed.to_lowercase();
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT u.session_id, s.title, u.id, u.speaker_id, COALESCE(sp.label, u.speaker_id), u.start_ms, u.text
-                 FROM utterances_fts f
-                 JOIN utterances u ON u.id = f.utterance_id
+                 FROM utterances u
                  JOIN sessions s ON s.id = u.session_id
                  LEFT JOIN speakers sp ON sp.session_id = u.session_id AND sp.id = u.speaker_id
-                 WHERE utterances_fts MATCH ?1
-                 ORDER BY rank
-                 LIMIT ?2",
+                 ORDER BY s.started_at DESC, u.start_ms ASC",
             )
             .map_err(|e| MimirError::Storage(e.to_string()))?;
-
         let rows = stmt
-            .query_map(params![trimmed, limit as i64], |r| {
+            .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
@@ -945,21 +954,213 @@ impl SessionStore {
             })
             .map_err(|e| MimirError::Storage(e.to_string()))?;
 
-        let mut hits = Vec::new();
         for r in rows {
+            if hits.len() >= limit {
+                break;
+            }
             let (sid, title, uid, spk_id, spk_label, start_ms, text) =
                 r.map_err(|e| MimirError::Storage(e.to_string()))?;
-            hits.push(SearchHit {
-                session_id: Uuid::parse_str(&sid).map_err(|e| MimirError::Storage(e.to_string()))?,
-                session_title: title,
-                utterance_id: Uuid::parse_str(&uid).map_err(|e| MimirError::Storage(e.to_string()))?,
-                speaker_id: spk_id,
-                speaker_label: spk_label,
-                start_ms: start_ms.max(0) as u64,
-                text,
-            });
+            let dec_text = self.dec_str(&text)?;
+            if dec_text.to_lowercase().contains(&needle) {
+                hits.push(SearchHit {
+                    session_id: Uuid::parse_str(&sid).map_err(|e| MimirError::Storage(e.to_string()))?,
+                    session_title: self.dec_opt(title)?,
+                    utterance_id: Uuid::parse_str(&uid).map_err(|e| MimirError::Storage(e.to_string()))?,
+                    speaker_id: spk_id,
+                    speaker_label: self.dec_str(&spk_label)?,
+                    start_ms: start_ms.max(0) as u64,
+                    text: dec_text,
+                });
+            }
         }
         Ok(hits)
+    }
+
+    /// Encrypts any pre-existing plaintext sessions, utterances, speakers, FTS entries, and WAL files.
+    pub fn encrypt_existing_data(&self) -> Result<usize> {
+        let mut migrated = 0usize;
+        let enc_store = SessionStore {
+            conn: Connection::open(self.data_dir.join("mimir.db"))
+                .map_err(|e| MimirError::Storage(e.to_string()))?,
+            data_dir: self.data_dir.clone(),
+            sessions_dir: self.sessions_dir.clone(),
+            encrypt_at_rest: true,
+        };
+
+        // 1. Encrypt plaintext session fields
+        let mut s_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, title, keywords_json, summary_markdown, action_items_json,
+                        calendar_event_uid, meeting_url, attendees_json
+                 FROM sessions",
+            )
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        let s_rows = s_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        for r in s_rows {
+            let (id, title, kws, sum_md, act, cal_uid, url, att) =
+                r.map_err(|e| MimirError::Storage(e.to_string()))?;
+            let needs = title.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"))
+                || !kws.starts_with("enc:v1:")
+                || sum_md.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"))
+                || act.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"))
+                || cal_uid.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"))
+                || url.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"))
+                || att.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"));
+            if needs {
+                enc_store
+                    .conn
+                    .execute(
+                        "UPDATE sessions
+                         SET title = ?1, keywords_json = ?2, summary_markdown = ?3,
+                             action_items_json = ?4, calendar_event_uid = ?5,
+                             meeting_url = ?6, attendees_json = ?7
+                         WHERE id = ?8",
+                        params![
+                            enc_store.enc_opt(title.as_deref())?,
+                            enc_store.enc_str(&kws)?,
+                            enc_store.enc_opt(sum_md.as_deref())?,
+                            enc_store.enc_opt(act.as_deref())?,
+                            enc_store.enc_opt(cal_uid.as_deref())?,
+                            enc_store.enc_opt(url.as_deref())?,
+                            enc_store.enc_opt(att.as_deref())?,
+                            id,
+                        ],
+                    )
+                    .map_err(|e| MimirError::Storage(e.to_string()))?;
+                migrated += 1;
+            }
+        }
+
+        // 2. Encrypt plaintext speakers
+        let mut sp_stmt = self
+            .conn
+            .prepare("SELECT session_id, id, label FROM speakers")
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        let sp_rows = sp_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        for r in sp_rows {
+            let (sid, id, label) = r.map_err(|e| MimirError::Storage(e.to_string()))?;
+            if !label.starts_with("enc:v1:") {
+                enc_store
+                    .conn
+                    .execute(
+                        "UPDATE speakers SET label = ?1 WHERE session_id = ?2 AND id = ?3",
+                        params![enc_store.enc_str(&label)?, sid, id],
+                    )
+                    .map_err(|e| MimirError::Storage(e.to_string()))?;
+                migrated += 1;
+            }
+        }
+
+        // 3. Encrypt plaintext utterances & scrub FTS5 plaintext
+        let mut u_stmt = self
+            .conn
+            .prepare("SELECT id, text, raw_text, words_json FROM utterances")
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        let u_rows = u_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| MimirError::Storage(e.to_string()))?;
+        for r in u_rows {
+            let (id, text, raw, words) = r.map_err(|e| MimirError::Storage(e.to_string()))?;
+            let needs = !text.starts_with("enc:v1:")
+                || raw.as_deref().is_some_and(|s| !s.starts_with("enc:v1:"))
+                || !words.starts_with("enc:v1:");
+            if needs {
+                enc_store
+                    .conn
+                    .execute(
+                        "UPDATE utterances SET text = ?1, raw_text = ?2, words_json = ?3 WHERE id = ?4",
+                        params![
+                            enc_store.enc_str(&text)?,
+                            enc_store.enc_opt(raw.as_deref())?,
+                            enc_store.enc_str(&words)?,
+                            id,
+                        ],
+                    )
+                    .map_err(|e| MimirError::Storage(e.to_string()))?;
+                migrated += 1;
+            }
+        }
+        let _ = enc_store
+            .conn
+            .execute("UPDATE utterances_fts SET text = '' WHERE text != ''", []);
+
+        // 4. Encrypt plaintext JSONL WAL files
+        if let Ok(entries) = fs::read_dir(&self.sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                    && let Ok(content) = fs::read_to_string(&path)
+                {
+                    let mut changed = false;
+                    let mut out_lines = Vec::new();
+                    for line in content.lines() {
+                        if line.trim().is_empty() || line.starts_with("enc:v1:") {
+                            out_lines.push(line.to_string());
+                        } else {
+                            out_lines.push(enc_store.enc_str(line)?);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let body = format!("{}\n", out_lines.join("\n"));
+                        atomic_write(&path, body.as_bytes())?;
+                        let _ = restrict_file_permissions(&path);
+                        migrated += 1;
+                    }
+                }
+            }
+        }
+
+        // 5. Encrypt plaintext WAV archives in audio/
+        let audio_dir = self.data_dir.join("audio");
+        if let Ok(entries) = fs::read_dir(&audio_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("wav")
+                    && let Ok(raw) = fs::read(&path)
+                {
+                    let enc = encrypt_bytes_at_rest(&self.data_dir, &raw)?;
+                    let mut enc_name = path.file_name().unwrap_or_default().to_os_string();
+                    enc_name.push(".enc");
+                    let enc_path = audio_dir.join(enc_name);
+                    atomic_write(&enc_path, &enc)?;
+                    let _ = restrict_file_permissions(&enc_path);
+                    let _ = fs::remove_file(&path);
+                    migrated += 1;
+                }
+            }
+        }
+
+        Ok(migrated)
     }
 }
 
@@ -1100,57 +1301,116 @@ mod tests {
     }
 
     #[test]
-    fn summarize_session_persists_summary_actions_autotitle_and_exports() {
+    fn at_rest_encryption_protects_sqlite_fts_and_wal_and_supports_search() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::open_with_encryption(dir.path(), true).unwrap();
+
+        let mut session = Session::new(Some("Secret Roadmap".into()), vec!["ProjectOrion".into()]);
+        session.speakers.insert(
+            "remote_1".into(),
+            SpeakerInfo {
+                id: "remote_1".into(),
+                label: "Secret Alice".into(),
+                channel: ChannelId::System,
+                is_host: false,
+            },
+        );
+        store.create_session(&session).unwrap();
+        store
+            .append_utterance(
+                session.id,
+                &Utterance {
+                    id: Uuid::new_v4(),
+                    speaker_id: "remote_1".into(),
+                    channel: ChannelId::System,
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    text: "Confidential launch phrase alpha-99.".into(),
+                    raw_text: None,
+                    language: "en".into(),
+                    avg_confidence: 0.99,
+                    words: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .update_session_summary(
+                session.id,
+                Some("## Secret Summary\n- Ship alpha-99"),
+                Some("notes"),
+                None,
+            )
+            .unwrap();
+
+        // Verify zero plaintext in SQLite file or JSONL WAL
+        let db_bytes = fs::read(dir.path().join("mimir.db")).unwrap();
+        let db_lossy = String::from_utf8_lossy(&db_bytes);
+        assert!(!db_lossy.contains("Secret Roadmap"));
+        assert!(!db_lossy.contains("Secret Alice"));
+        assert!(!db_lossy.contains("Confidential launch phrase"));
+        assert!(!db_lossy.contains("Secret Summary"));
+
+        let wal_text = fs::read_to_string(dir.path().join("sessions").join(format!("{}.jsonl", session.id))).unwrap();
+        assert!(!wal_text.contains("Confidential launch phrase"));
+        assert!(wal_text.lines().all(|l| l.starts_with("enc:v1:")));
+
+        // Verify decrypted reads & search work transparently
+        let loaded = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Secret Roadmap"));
+        assert_eq!(loaded.speakers["remote_1"].label, "Secret Alice");
+        assert_eq!(loaded.utterances[0].text, "Confidential launch phrase alpha-99.");
+        assert_eq!(
+            loaded.summary_markdown.as_deref(),
+            Some("## Secret Summary\n- Ship alpha-99")
+        );
+
+        let hits = store.search("alpha-99", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].speaker_label, "Secret Alice");
+        assert_eq!(hits[0].session_title.as_deref(), Some("Secret Roadmap"));
+    }
+
+    #[test]
+    fn update_session_summary_persists_and_exports() {
         let dir = TempDir::new().unwrap();
         let store = SessionStore::open(dir.path()).unwrap();
 
-        let mut session = Session::new(None, vec!["Mimir".into()]);
+        let mut session = Session::new(Some("Architecture Sync".into()), vec!["Mimir".into()]);
         session.calendar_event_uid = Some("cal-evt-42".into());
         session.meeting_url = Some("https://meet.google.com/abc-defg-hij".into());
         session.attendees_json = Some(r#"["Host","Alice"]"#.into());
         store.create_session(&session).unwrap();
 
-        let u1 = sample_utterance(ChannelId::Mic, "host", 1000, "We should ship local Qwen summaries this week.");
-        let u2 = sample_utterance(ChannelId::System, "host", 4000, "I will update the SQLite schema by Friday.");
+        let u1 = sample_utterance(ChannelId::Mic, "host", 1000, "Let's keep summaries in MCP.");
         store.append_utterance(session.id, &u1).unwrap();
-        store.append_utterance(session.id, &u2).unwrap();
 
-        let mut progress_calls = Vec::new();
-        let res = store
-            .summarize_session_with_progress(
-                session.id,
-                "technical_review",
-                |sys, _usr, _max| {
-                    if sys.contains("JSON array") {
-                        Ok(r#"[{"owner":"Host","task":"Update SQLite schema","due_hint":"Friday","timestamp":"00:00:04"}]"#.into())
-                    } else if sys.contains("3 to 7 word") {
-                        Ok("Local Qwen Summary Review".into())
-                    } else {
-                        Ok("### Key Decisions\n- Ship local Qwen summaries this week.".into())
-                    }
-                },
-                |done, total| progress_calls.push((done, total)),
-            )
-            .unwrap();
-
-        assert_eq!(res.summary_template, "technical_review");
-        assert_eq!(res.auto_title.as_deref(), Some("Local Qwen Summary Review"));
-        assert_eq!(res.action_items.len(), 1);
-        assert_eq!(progress_calls.last(), Some(&(3, 3)));
+        let actions_json = r#"[{"owner":"Host","task":"Update MCP tools","due_hint":"Friday","timestamp":"00:00:01"}]"#;
+        assert!(
+            store
+                .update_session_summary(
+                    session.id,
+                    Some("MCP clients handle summarization and store results here."),
+                    Some("notes"),
+                    Some(actions_json),
+                )
+                .unwrap()
+        );
 
         let loaded = store.get_session(session.id).unwrap().unwrap();
-        assert_eq!(loaded.title.as_deref(), Some("Local Qwen Summary Review"));
         assert_eq!(loaded.calendar_event_uid.as_deref(), Some("cal-evt-42"));
         assert_eq!(
             loaded.meeting_url.as_deref(),
             Some("https://meet.google.com/abc-defg-hij")
         );
-        assert!(loaded.summary_markdown.as_deref().unwrap().contains("Key Decisions"));
+        assert_eq!(
+            loaded.summary_markdown.as_deref(),
+            Some("MCP clients handle summarization and store results here.")
+        );
 
         let md = export::render_session(&loaded, TranscriptFormat::Markdown).unwrap();
-        assert!(md.contains("## Summary (technical_review)"));
+        assert!(md.contains("## Summary (notes)"));
         assert!(md.contains("## Action Items"));
-        assert!(md.contains("**Host:** Update SQLite schema (due: Friday, @ 00:00:04)"));
+        assert!(md.contains("**Host:** Update MCP tools (due: Friday, @ 00:00:01)"));
         assert!(md.contains("**Meeting URL:** https://meet.google.com/abc-defg-hij"));
 
         let mut cfg = MimirConfig::default();
@@ -1159,7 +1419,7 @@ mod tests {
         let synced = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg).unwrap();
         assert!(synced.is_some());
         let (md_path, _) = synced.unwrap();
-        assert!(std::fs::read_to_string(md_path).unwrap().contains("## Summary (technical_review)"));
+        assert!(std::fs::read_to_string(md_path).unwrap().contains("## Summary (notes)"));
     }
 }
 

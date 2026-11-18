@@ -9,22 +9,27 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_BIN_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
-echo "==> 1. Building Rust mimir-cli (release)..."
-(cd "$ROOT_DIR" && cargo build --release)
+echo "==> 1. Building Rust mimir & mimir-desktop (release)..."
+(cd "$ROOT_DIR" && cargo build --release --bin mimir --bin mimir-desktop)
 
-echo "==> 2. Building SwiftUI Mimir.app (release)..."
+echo "==> 2. Building macOS ScreenCaptureKit helper mimir-sc-tap (release)..."
 "$MACOS_DIR/scripts/build.sh" -c release
 
-SWIFT_BIN="$(cd "$MACOS_DIR" && "$MACOS_DIR/scripts/build.sh" -c release --show-bin-path)/Mimir"
+BIN_DIR="$(cd "$MACOS_DIR" && "$MACOS_DIR/scripts/build.sh" -c release --show-bin-path)"
+TAP_BIN="$BIN_DIR/mimir-sc-tap"
+CAL_BIN="$BIN_DIR/mimir-calendar"
+UI_BIN="$ROOT_DIR/target/release/mimir-desktop"
 RUST_BIN="$ROOT_DIR/target/release/mimir"
 
 echo "==> 3. Assembling Mimir.app bundle..."
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_BIN_DIR" "$RESOURCES_DIR"
 
-cp "$SWIFT_BIN" "$MACOS_BIN_DIR/Mimir"
+cp "$UI_BIN" "$MACOS_BIN_DIR/Mimir"
 cp "$RUST_BIN" "$MACOS_BIN_DIR/mimir-cli"
-chmod +x "$MACOS_BIN_DIR/Mimir" "$MACOS_BIN_DIR/mimir-cli"
+cp "$TAP_BIN" "$MACOS_BIN_DIR/mimir-sc-tap"
+cp "$CAL_BIN" "$MACOS_BIN_DIR/mimir-calendar"
+chmod +x "$MACOS_BIN_DIR/Mimir" "$MACOS_BIN_DIR/mimir-cli" "$MACOS_BIN_DIR/mimir-sc-tap" "$MACOS_BIN_DIR/mimir-calendar"
 if [ -f "$MACOS_DIR/Resources/AppIcon.icns" ]; then
     cp "$MACOS_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 fi
@@ -68,8 +73,11 @@ cat << 'PLIST' > "$CONTENTS_DIR/Info.plist"
 </plist>
 PLIST
 
-VERSION="${MIMIR_VERSION:-0.1.0}"
+VERSION="${MIMIR_VERSION:-0.2.0}"
 VERSION="${VERSION#v}"
 sed -i '' "s/__MIMIR_VERSION__/${VERSION}/g" "$CONTENTS_DIR/Info.plist"
+
+echo "==> 4. Ad-hoc codesigning Mimir.app for macOS TCC permissions..."
+codesign --force --deep --sign - "$APP_DIR"
 
 echo "✓ Bundled $APP_DIR"

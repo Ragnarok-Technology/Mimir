@@ -20,7 +20,9 @@ echo "✓ Signature valid on disk"
 echo "==> 2. Creating staging disk image..."
 hdiutil detach /Volumes/Mimir -force 2>/dev/null || true
 rm -f "$DMG_TEMP" "$DMG_FINAL"
-hdiutil create -size 45m -fs HFS+ -volname "Mimir" -ov "$DMG_TEMP" > /dev/null
+APP_MB=$(du -sm "$APP_DIR" | awk '{print $1}')
+DMG_MB=$((APP_MB + 40))
+hdiutil create -size "${DMG_MB}m" -fs HFS+ -volname "Mimir" -ov "$DMG_TEMP" > /dev/null
 
 ATTACH_INFO=$(hdiutil attach -readwrite -noverify -noautoopen "$DMG_TEMP")
 DEVICE=$(echo "$ATTACH_INFO" | head -n 1 | awk '{print $1}')

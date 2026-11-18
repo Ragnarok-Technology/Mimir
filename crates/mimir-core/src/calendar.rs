@@ -19,6 +19,14 @@ pub struct CalendarEvent {
     pub source: String,
 }
 
+/// Status summary for a single calendar app, account, or feed source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSourceStatus {
+    pub name: String,
+    pub status: String,
+    pub event_count: usize,
+}
+
 /// Extracts the first supported video-conferencing URL (Zoom, Google Meet, Microsoft Teams, Webex)
 /// from arbitrary event location, URL, or description text.
 pub fn extract_meeting_url(text: &str) -> Option<String> {
@@ -286,6 +294,335 @@ pub fn open_url_in_system_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Encodes bytes as standard RFC 4648 Base64 (used for CalDAV HTTP Basic Auth).
+pub fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn unescape_xml_entities(input: &str) -> String {
+    let trimmed = input.trim();
+    let stripped = if let Some(inner) = trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+    {
+        inner
+    } else {
+        trimmed
+    };
+    stripped
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Extracts all `<calendar-data>` / `<C:calendar-data>` / `<cal:calendar-data>` VCALENDAR payloads
+/// from a CalDAV `REPORT` XML multistatus response.
+pub fn extract_caldav_ics_blocks(xml_body: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let lower = xml_body.to_ascii_lowercase();
+    let mut cursor = 0;
+
+    while cursor < lower.len() {
+        let Some(rel_open) = lower[cursor..].find("calendar-data") else {
+            break;
+        };
+        let tag_name_pos = cursor + rel_open;
+        let Some(open_lt) = lower[..tag_name_pos].rfind('<') else {
+            cursor = tag_name_pos + "calendar-data".len();
+            continue;
+        };
+        // Ensure it's an opening tag (`<calendar-data` or `<prefix:calendar-data`), not `</...`
+        let between = &lower[open_lt + 1..tag_name_pos];
+        if between.starts_with('/') || (!between.is_empty() && !between.ends_with(':')) {
+            cursor = tag_name_pos + "calendar-data".len();
+            continue;
+        }
+        let Some(rel_gt) = lower[tag_name_pos..].find('>') else {
+            break;
+        };
+        let content_start = tag_name_pos + rel_gt + 1;
+        // Self-closing tag `<calendar-data/>`
+        if lower[tag_name_pos..content_start - 1].trim_end().ends_with('/') {
+            cursor = content_start;
+            continue;
+        }
+
+        // Find matching closing tag `</...calendar-data>`
+        let mut search_end = content_start;
+        let mut found_end = None;
+        while let Some(rel_close) = lower[search_end..].find("calendar-data>") {
+            let close_name_pos = search_end + rel_close;
+            if let Some(close_lt) = lower[content_start..close_name_pos].rfind("</") {
+                let abs_close_lt = content_start + close_lt;
+                let close_prefix = &lower[abs_close_lt + 2..close_name_pos];
+                if close_prefix.is_empty() || close_prefix.ends_with(':') {
+                    found_end = Some((abs_close_lt, close_name_pos + "calendar-data>".len()));
+                    break;
+                }
+            }
+            search_end = close_name_pos + "calendar-data>".len();
+        }
+
+        if let Some((content_end, next_cursor)) = found_end {
+            let raw_ics = unescape_xml_entities(&xml_body[content_start..content_end]);
+            if !raw_ics.trim().is_empty() {
+                blocks.push(raw_ics);
+            }
+            cursor = next_cursor;
+        } else {
+            break;
+        }
+    }
+
+    blocks
+}
+
+fn parse_rfc3339_or_date(dt_opt: Option<&str>, date_opt: Option<&str>) -> Option<i64> {
+    if let Some(dt_str) = dt_opt {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(dt_str.trim()) {
+            return Some(dt.with_timezone(&Utc).timestamp());
+        }
+        // Microsoft Graph often returns naive UTC-ish timestamps like "2026-11-15T22:00:00.0000000"
+        let trimmed = dt_str.trim().split('.').next().unwrap_or(dt_str.trim());
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc).timestamp());
+        }
+    }
+    if let Some(date_str) = date_opt {
+        if let Ok(nd) = NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d") {
+            let ndt = nd.and_hms_opt(0, 0, 0)?;
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc).timestamp());
+        }
+    }
+    None
+}
+
+/// Parses a Google Calendar v3 `/calendars/primary/events` JSON response into `CalendarEvent`s.
+pub fn parse_google_calendar_json(json_str: &str, source_label: &str) -> Vec<CalendarEvent> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(items) = root.get("items").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for item in items {
+        if item.get("status").and_then(|v| v.as_str()) == Some("cancelled") {
+            continue;
+        }
+        let start_obj = item.get("start");
+        let end_obj = item.get("end");
+        let Some(start_ts) = parse_rfc3339_or_date(
+            start_obj.and_then(|s| s.get("dateTime")).and_then(|v| v.as_str()),
+            start_obj.and_then(|s| s.get("date")).and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let end_ts = parse_rfc3339_or_date(
+            end_obj.and_then(|s| s.get("dateTime")).and_then(|v| v.as_str()),
+            end_obj.and_then(|s| s.get("date")).and_then(|v| v.as_str()),
+        )
+        .unwrap_or(start_ts + 3600)
+        .max(start_ts);
+
+        let title = item
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Untitled Meeting")
+            .to_string();
+        let uid = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("gcal:{s}"))
+            .unwrap_or_else(|| format!("gcal:{start_ts}:{title}"));
+
+        let hangout = item.get("hangoutLink").and_then(|v| v.as_str());
+        let conf_uri = item
+            .get("conferenceData")
+            .and_then(|c| c.get("entryPoints"))
+            .and_then(|e| e.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|ep| {
+                    let ep_type = ep.get("entryPointType").and_then(|v| v.as_str()).unwrap_or("");
+                    if ep_type == "video" || ep_type.is_empty() {
+                        ep.get("uri").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                })
+            });
+        let location = item.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        let description = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
+
+        let meeting_url = hangout
+            .map(str::to_string)
+            .or_else(|| conf_uri.map(str::to_string))
+            .or_else(|| extract_meeting_url(location))
+            .or_else(|| extract_meeting_url(description));
+
+        let attendees: Vec<String> = item
+            .get("attendees")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        a.get("displayName")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| a.get("email").and_then(|v| v.as_str()).map(str::trim))
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let notes_or_agenda = if description.trim().is_empty() {
+            None
+        } else {
+            Some(description.trim().to_string())
+        };
+
+        events.push(CalendarEvent {
+            uid,
+            title,
+            start_ts,
+            end_ts,
+            meeting_url,
+            attendees,
+            notes_or_agenda,
+            source: source_label.to_string(),
+        });
+    }
+    events.sort_by_key(|e| e.start_ts);
+    events
+}
+
+/// Parses a Microsoft Graph `/me/calendarView` JSON response into `CalendarEvent`s.
+pub fn parse_microsoft_graph_json(json_str: &str, source_label: &str) -> Vec<CalendarEvent> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(items) = root.get("value").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for item in items {
+        if item.get("isCancelled").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(start_ts) = parse_rfc3339_or_date(
+            item.get("start")
+                .and_then(|s| s.get("dateTime"))
+                .and_then(|v| v.as_str()),
+            None,
+        ) else {
+            continue;
+        };
+        let end_ts = parse_rfc3339_or_date(
+            item.get("end")
+                .and_then(|s| s.get("dateTime"))
+                .and_then(|v| v.as_str()),
+            None,
+        )
+        .unwrap_or(start_ts + 3600)
+        .max(start_ts);
+
+        let title = item
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Untitled Meeting")
+            .to_string();
+        let uid = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("msgraph:{s}"))
+            .unwrap_or_else(|| format!("msgraph:{start_ts}:{title}"));
+
+        let online_url = item
+            .get("onlineMeeting")
+            .and_then(|m| m.get("joinUrl"))
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("onlineMeetingUrl").and_then(|v| v.as_str()));
+        let location = item
+            .get("location")
+            .and_then(|l| l.get("displayName"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let body_preview = item.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
+
+        let meeting_url = online_url
+            .map(str::to_string)
+            .or_else(|| extract_meeting_url(location))
+            .or_else(|| extract_meeting_url(body_preview));
+
+        let attendees: Vec<String> = item
+            .get("attendees")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        let ea = a.get("emailAddress")?;
+                        ea.get("name")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| ea.get("address").and_then(|v| v.as_str()).map(str::trim))
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let notes_or_agenda = if body_preview.trim().is_empty() {
+            None
+        } else {
+            Some(body_preview.trim().to_string())
+        };
+
+        events.push(CalendarEvent {
+            uid,
+            title,
+            start_ts,
+            end_ts,
+            meeting_url,
+            attendees,
+            notes_or_agenda,
+            source: source_label.to_string(),
+        });
+    }
+    events.sort_by_key(|e| e.start_ts);
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +688,123 @@ mod tests {
         assert_eq!(upcoming_or_active_events(&events, ev.start_ts + 900, 900).len(), 1);
         // 2 hours before -> excluded
         assert_eq!(upcoming_or_active_events(&events, ev.start_ts - 7200, 900).len(), 0);
+    }
+
+    #[test]
+    fn encodes_base64_for_caldav_basic_auth() {
+        assert_eq!(base64_encode(b"alice@icloud.com:app-pass"), "YWxpY2VAaWNsb3VkLmNvbTphcHAtcGFzcw==");
+        assert_eq!(base64_encode(b"a"), "YQ==");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn extracts_caldav_calendar_data_blocks_and_parses_events() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8" ?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/ev1.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:caldav-1
+SUMMARY:iCloud &amp; Fastmail Sync
+DTSTART:20261116T180000Z
+DTEND:20261116T183000Z
+LOCATION:https://acme.zoom.us/j/987654321
+END:VEVENT
+END:VCALENDAR</C:calendar-data>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let blocks = extract_caldav_ics_blocks(xml);
+        assert_eq!(blocks.len(), 1);
+        let events = parse_ics(&blocks[0], "caldav:iCloud");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "iCloud & Fastmail Sync");
+        assert_eq!(
+            events[0].meeting_url.as_deref(),
+            Some("https://acme.zoom.us/j/987654321")
+        );
+        assert_eq!(events[0].source, "caldav:iCloud");
+    }
+
+    #[test]
+    fn parses_google_calendar_json_events() {
+        let json = r#"{
+            "items": [
+                {
+                    "id": "g1",
+                    "status": "confirmed",
+                    "summary": "Design Review",
+                    "start": { "dateTime": "2026-11-16T19:00:00Z" },
+                    "end": { "dateTime": "2026-11-16T19:45:00Z" },
+                    "hangoutLink": "https://meet.google.com/abc-defg-hij",
+                    "attendees": [
+                        { "displayName": "Alice", "email": "alice@example.com" },
+                        { "email": "bob@example.com" }
+                    ],
+                    "description": "Review Obsidian Prism UI"
+                },
+                {
+                    "id": "g2",
+                    "status": "cancelled",
+                    "summary": "Cancelled Sync",
+                    "start": { "dateTime": "2026-11-16T20:00:00Z" },
+                    "end": { "dateTime": "2026-11-16T20:30:00Z" }
+                }
+            ]
+        }"#;
+
+        let events = parse_google_calendar_json(json, "google:Work");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "gcal:g1");
+        assert_eq!(events[0].title, "Design Review");
+        assert_eq!(
+            events[0].meeting_url.as_deref(),
+            Some("https://meet.google.com/abc-defg-hij")
+        );
+        assert_eq!(events[0].attendees, vec!["Alice", "bob@example.com"]);
+        assert_eq!(events[0].source, "google:Work");
+    }
+
+    #[test]
+    fn parses_microsoft_graph_json_events() {
+        let json = r#"{
+            "value": [
+                {
+                    "id": "m1",
+                    "subject": "Quarterly Planning",
+                    "isCancelled": false,
+                    "start": { "dateTime": "2026-11-16T21:00:00.0000000", "timeZone": "UTC" },
+                    "end": { "dateTime": "2026-11-16T22:00:00.0000000", "timeZone": "UTC" },
+                    "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3aabc/0" },
+                    "bodyPreview": "Q4 roadmap",
+                    "attendees": [
+                        { "emailAddress": { "name": "Carol", "address": "carol@contoso.com" } }
+                    ]
+                },
+                {
+                    "id": "m2",
+                    "subject": "Cancelled",
+                    "isCancelled": true,
+                    "start": { "dateTime": "2026-11-16T23:00:00.0000000", "timeZone": "UTC" },
+                    "end": { "dateTime": "2026-11-16T23:30:00.0000000", "timeZone": "UTC" }
+                }
+            ]
+        }"#;
+
+        let events = parse_microsoft_graph_json(json, "microsoft:Contoso");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "msgraph:m1");
+        assert_eq!(events[0].title, "Quarterly Planning");
+        assert_eq!(
+            events[0].meeting_url.as_deref(),
+            Some("https://teams.microsoft.com/l/meetup-join/19%3aabc/0")
+        );
+        assert_eq!(events[0].attendees, vec!["Carol"]);
+        assert_eq!(events[0].source, "microsoft:Contoso");
     }
 }

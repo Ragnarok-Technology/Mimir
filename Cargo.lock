@@ -2955,7 +2955,7 @@ checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
 
 [[package]]
 name = "mimir-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "mimir-core",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "dirs",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -3018,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-diarize"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mimir-core",
  "serde",
@@ -3028,10 +3028,11 @@ dependencies = [
 
 [[package]]
 name = "mimir-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "chrono",
+ "hex",
  "mimir-core",
  "rusqlite",
  "serde",
@@ -3043,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3055,6 +3056,7 @@ dependencies = [
  "mimir-diarize",
  "mimir-store",
  "mimir-whistle",
+ "rusqlite",
  "serde",
  "serde_json",
  "ureq",
@@ -3063,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-whistle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "candle-core",
  "candle-transformers",

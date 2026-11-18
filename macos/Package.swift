@@ -8,7 +8,8 @@ let package = Package(
     ],
     products: [
         .library(name: "MimirCore", targets: ["MimirCore"]),
-        .executable(name: "Mimir", targets: ["MimirApp"])
+        .executable(name: "mimir-sc-tap", targets: ["MimirTap"]),
+        .executable(name: "mimir-calendar", targets: ["MimirCalendar"])
     ],
     targets: [
         .target(
@@ -16,9 +17,13 @@ let package = Package(
             path: "Sources/MimirCore"
         ),
         .executableTarget(
-            name: "MimirApp",
+            name: "MimirTap",
             dependencies: ["MimirCore"],
-            path: "Sources/MimirApp"
+            path: "Sources/MimirTap"
+        ),
+        .executableTarget(
+            name: "MimirCalendar",
+            path: "Sources/MimirCalendar"
         ),
         .executableTarget(
             name: "MimirCoreTests",
