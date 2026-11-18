@@ -1,4 +1,5 @@
-//! Local, zero-bot OS call-app detection (Zoom, Teams, Google Meet, Slack, Discord, FaceTime, Webex).
+//! Local, zero-bot OS call-app detection across macOS, Windows, and Linux
+//! (Zoom, Microsoft Teams, Google Meet, Slack, Discord, FaceTime, Webex across all major browsers).
 
 use serde::{Deserialize, Serialize};
 
@@ -44,16 +45,42 @@ pub struct CallDetectionSnapshot {
     pub status_note: Option<String>,
 }
 
+/// Strips trailing browser suffixes (e.g. `" - Google Chrome"`, `" — Mozilla Firefox"`).
+fn strip_browser_suffix(title: &str) -> &str {
+    const SUFFIXES: [&str; 12] = [
+        " - Google Chrome",
+        " — Mozilla Firefox",
+        " - Mozilla Firefox",
+        " - Microsoft Edge",
+        " - Brave",
+        " - Vivaldi",
+        " - Opera",
+        " - Arc",
+        " - Safari",
+        " — Zen Browser",
+        " - Zen Browser",
+        " - Chromium",
+    ];
+    let mut s = title.trim();
+    for suffix in SUFFIXES {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.trim();
+            break;
+        }
+    }
+    s
+}
+
 /// Detects an active call from a browser tab / window title (cross-platform).
 pub fn parse_call_from_window_title(app_name: &str, title: &str) -> Option<ActiveCallInfo> {
-    let t = title.trim();
+    let t = strip_browser_suffix(title);
     if t.is_empty() {
         return None;
     }
     let app_lower = app_name.to_ascii_lowercase();
     let t_lower = t.to_ascii_lowercase();
 
-    // Google Meet in browser: "Meet - <code/title>" or "Google Meet - <title>"
+    // Google Meet in any browser: "Meet - <code/title>" or "Google Meet - <title>"
     if t_lower.starts_with("meet - ") || t_lower.starts_with("google meet - ") {
         let meeting = t
             .split_once(" - ")
@@ -70,8 +97,10 @@ pub fn parse_call_from_window_title(app_name: &str, title: &str) -> Option<Activ
         });
     }
 
-    // Zoom native or web client
-    if (app_lower.contains("zoom") && !t_lower.eq("zoom workplace") && !t_lower.eq("zoom"))
+    // Zoom native or web client ("Zoom Meeting", "Zoom Webinar", or browser Zoom tab)
+    if (app_lower.contains("zoom") || t_lower.contains("zoom meeting") || t_lower.contains("zoom webinar"))
+        && !t_lower.eq("zoom workplace")
+        && !t_lower.eq("zoom")
         && (t_lower.contains("zoom meeting")
             || t_lower.contains("meeting")
             || t_lower.contains("webinar"))
@@ -116,7 +145,7 @@ pub fn parse_call_from_window_title(app_name: &str, title: &str) -> Option<Activ
     }
 
     // Slack Huddle
-    if app_lower.contains("slack") && t_lower.contains("huddle") {
+    if (app_lower.contains("slack") || t_lower.starts_with("huddle")) && t_lower.contains("huddle") {
         return Some(ActiveCallInfo {
             provider: CallProvider::Slack,
             app_name: "Slack".to_string(),
@@ -127,7 +156,7 @@ pub fn parse_call_from_window_title(app_name: &str, title: &str) -> Option<Activ
         });
     }
 
-    // Discord voice/call (includes "Voice Connected" or popout call windows)
+    // Discord voice/call
     if app_lower.contains("discord")
         && (t_lower.contains("voice") || t_lower.contains("call") || t_lower.contains("huddle"))
     {
@@ -142,7 +171,9 @@ pub fn parse_call_from_window_title(app_name: &str, title: &str) -> Option<Activ
     }
 
     // Webex
-    if app_lower.contains("webex") && (t_lower.contains("meeting") || t_lower.contains("call")) {
+    if (app_lower.contains("webex") || t_lower.contains("webex"))
+        && (t_lower.contains("meeting") || t_lower.contains("call"))
+    {
         return Some(ActiveCallInfo {
             provider: CallProvider::Webex,
             app_name: "Webex".to_string(),
@@ -168,7 +199,7 @@ pub fn parse_call_from_window_title(app_name: &str, title: &str) -> Option<Activ
     None
 }
 
-/// Filters raw Accessibility / UI text labels down to plausible participant display names.
+/// Filters raw Accessibility / UI Automation text labels down to plausible participant display names.
 pub fn filter_participant_candidates(raw_labels: &[String], self_label: Option<&str>) -> Vec<String> {
     const UI_CHROME: [&str; 38] = [
         "mute",
@@ -252,6 +283,24 @@ pub fn filter_participant_candidates(raw_labels: &[String], self_label: Option<&
     out
 }
 
+fn extract_participants_and_speaker(
+    raw_labels: &[String],
+    self_label: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let mut active_speaker = None;
+    for l in raw_labels {
+        if l.to_ascii_lowercase().contains("speaking") {
+            let cleaned = filter_participant_candidates(std::slice::from_ref(l), self_label);
+            if let Some(first) = cleaned.into_iter().next() {
+                active_speaker = Some(first);
+                break;
+            }
+        }
+    }
+    let participants = filter_participant_candidates(raw_labels, self_label);
+    (participants, active_speaker)
+}
+
 /// Opens macOS Accessibility Privacy settings so the user can grant UI inspection permission.
 pub fn open_accessibility_settings() {
     #[cfg(target_os = "macos")]
@@ -295,7 +344,7 @@ fn detect_macos_active_call(self_label: Option<&str>) -> CallDetectionSnapshot {
 
     let ax_trusted = macos_accessibility_trusted();
 
-    // 1. Check browser tabs (Chrome, Arc, Brave, Edge, Safari) for Meet / Teams / Zoom web.
+    // 1. Check AppleScript-scriptable browser tabs (Chrome, Arc, Brave, Edge, Vivaldi, Opera, Safari).
     if let Some(mut browser_call) = detect_macos_browser_call() {
         if ax_trusted {
             let (participants, speaker) =
@@ -310,35 +359,8 @@ fn detect_macos_active_call(self_label: Option<&str>) -> CallDetectionSnapshot {
         };
     }
 
-    let mut running_hints: Vec<&'static str> = Vec::new();
-    if ps_lower.contains("zoom.us") || ps_lower.contains("cpthost") {
-        running_hints.push("zoom");
-    }
-    if ps_lower.contains("microsoft teams") || ps_lower.contains("msteams") {
-        running_hints.push("teams");
-    }
-    if ps_lower.contains("slack") {
-        running_hints.push("slack");
-    }
-    if ps_lower.contains("discord") {
-        running_hints.push("discord");
-    }
-    if ps_lower.contains("facetime") || ps_lower.contains("avconferenced") {
-        running_hints.push("facetime");
-    }
-    if ps_lower.contains("webex") {
-        running_hints.push("webex");
-    }
-
-    if running_hints.is_empty() {
-        return CallDetectionSnapshot {
-            active_call: None,
-            accessibility_granted: ax_trusted,
-            status_note: None,
-        };
-    }
-
-    // 2. When Accessibility is trusted, inspect native call app windows + participant/speaker labels.
+    // 2. When Accessibility is trusted, inspect all native call apps + non-AppleScript browsers
+    //    (Firefox, Zen, Orion) for active call windows and participant/speaker labels.
     if ax_trusted
         && let Some(call) = detect_macos_ax_call(self_label)
     {
@@ -349,7 +371,7 @@ fn detect_macos_active_call(self_label: Option<&str>) -> CallDetectionSnapshot {
         };
     }
 
-    // 3. Process-level fallbacks that only exist during an active call.
+    // 3. Process-level fallback for Zoom CptHost (only spawned during an active Zoom meeting).
     if ps_lower.contains("cpthost") {
         return CallDetectionSnapshot {
             active_call: Some(ActiveCallInfo {
@@ -362,7 +384,7 @@ fn detect_macos_active_call(self_label: Option<&str>) -> CallDetectionSnapshot {
             }),
             accessibility_granted: ax_trusted,
             status_note: (!ax_trusted).then(|| {
-                "Grant Accessibility permission in Settings for Zoom participant names".to_string()
+                "Grant Accessibility permission in Settings for participant names".to_string()
             }),
         };
     }
@@ -394,7 +416,7 @@ fn macos_accessibility_trusted() -> bool {
 fn detect_macos_browser_call() -> Option<ActiveCallInfo> {
     let jxa = r#"
 (function() {
-  const chromium = ["Google Chrome", "Arc", "Brave Browser", "Microsoft Edge"];
+  const chromium = ["Google Chrome", "Arc", "Brave Browser", "Microsoft Edge", "Vivaldi", "Opera"];
   for (const name of chromium) {
     try {
       const app = Application(name);
@@ -418,28 +440,30 @@ fn detect_macos_browser_call() -> Option<ActiveCallInfo> {
       }
     } catch (e) {}
   }
-  try {
-    const safari = Application("Safari");
-    if (safari.running()) {
-      const wins = safari.windows();
+  const webkit = ["Safari", "Orion"];
+  for (const name of webkit) {
+    try {
+      const app = Application(name);
+      if (!app.running()) continue;
+      const wins = app.windows();
       for (let i = 0; i < wins.length; i++) {
         const tabs = wins[i].tabs();
         for (let j = 0; j < tabs.length; j++) {
           const url = String(tabs[j].url() || "");
           const title = String(tabs[j].name() || "");
           if (url.includes("meet.google.com/") && !url.endsWith("meet.google.com/")) {
-            return JSON.stringify({ app: "Safari", title: title, url: url });
+            return JSON.stringify({ app: name, title: title, url: url });
           }
           if (url.includes("teams.microsoft.com") && (title.toLowerCase().includes("meeting") || title.toLowerCase().includes("call"))) {
-            return JSON.stringify({ app: "Safari", title: title, url: url });
+            return JSON.stringify({ app: name, title: title, url: url });
           }
           if (url.includes("zoom.us/wc/")) {
-            return JSON.stringify({ app: "Safari", title: title, url: url });
+            return JSON.stringify({ app: name, title: title, url: url });
           }
         }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
   return "";
 })();
 "#;
@@ -529,7 +553,7 @@ fn detect_macos_ax_call(self_label: Option<&str>) -> Option<ActiveCallInfo> {
     let jxa = r#"
 (function() {
   const se = Application("System Events");
-  const targets = ["zoom.us", "Microsoft Teams", "Slack", "Discord", "FaceTime", "Webex"];
+  const targets = ["zoom.us", "Microsoft Teams", "Slack", "Discord", "FaceTime", "Webex", "Firefox", "Zen"];
   const procs = se.processes();
   for (let i = 0; i < procs.length; i++) {
     const p = procs[i];
@@ -544,14 +568,14 @@ fn detect_macos_ax_call(self_label: Option<&str>) -> Option<ActiveCallInfo> {
       const low = wtitle.toLowerCase();
       let labels = [];
       let looksLikeCall = low.includes("zoom meeting")
+        || low.startsWith("meet - ")
+        || low.startsWith("google meet - ")
         || (pname.toLowerCase().includes("teams") && (low.includes("call") || low.includes("meeting") || low.includes("|")))
         || (pname.toLowerCase().includes("slack") && low.includes("huddle"))
         || (pname.toLowerCase().includes("discord") && (low.includes("voice") || low.includes("call")))
         || (pname.toLowerCase().includes("facetime") && wtitle.length > 0 && low !== "facetime")
         || (pname.toLowerCase().includes("webex") && (low.includes("meeting") || low.includes("call")));
 
-      // For Electron/native apps whose main window title stays static during a call (Discord/Slack),
-      // inspect shallow AX labels for "Voice Connected" or "Leave huddle".
       try {
         const elems = wins[w].entireContents();
         const cap = Math.min(elems.length, 140);
@@ -636,27 +660,34 @@ fn detect_macos_ax_call(self_label: Option<&str>) -> Option<ActiveCallInfo> {
     Some(call)
 }
 
-fn extract_participants_and_speaker(
-    raw_labels: &[String],
-    self_label: Option<&str>,
-) -> (Vec<String>, Option<String>) {
-    let mut active_speaker = None;
-    for l in raw_labels {
-        if l.to_ascii_lowercase().contains("speaking") {
-            let cleaned = filter_participant_candidates(std::slice::from_ref(l), self_label);
-            if let Some(first) = cleaned.into_iter().next() {
-                active_speaker = Some(first);
-                break;
-            }
-        }
-    }
-    let participants = filter_participant_candidates(raw_labels, self_label);
-    (participants, active_speaker)
-}
-
 #[cfg(target_os = "windows")]
-fn detect_windows_active_call(_self_label: Option<&str>) -> CallDetectionSnapshot {
-    let ps = r#"Get-Process | Where-Object { $_.MainWindowTitle -ne '' -or $_.ProcessName -eq 'CptHost' } | Select-Object ProcessName,MainWindowTitle | ConvertTo-Json -Compress"#;
+fn detect_windows_active_call(self_label: Option<&str>) -> CallDetectionSnapshot {
+    // Inspect window titles + UI Automation shallow element names for call apps and all browsers.
+    let ps = r#"
+Add-Type -AssemblyName UIAutomationClient | Out-Null
+$procs = Get-Process | Where-Object { $_.MainWindowTitle -ne '' -or $_.ProcessName -eq 'CptHost' }
+$res = @()
+foreach ($p in $procs) {
+  $labels = @()
+  if ($p.MainWindowHandle -ne 0 -and ($p.ProcessName -match 'Zoom|Teams|Discord|Slack|Webex|chrome|msedge|firefox|brave|opera|vivaldi')) {
+    try {
+      $el = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
+      $cond = New-Object System.Windows.Automation.OrCondition(
+        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)),
+        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))
+      )
+      $children = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+      $cap = [Math]::Min($children.Count, 120)
+      for ($i = 0; $i -lt $cap; $i++) {
+        $n = $children[$i].Current.Name
+        if ($n -and $n.Length -ge 2 -and $n.Length -le 64) { $labels += $n }
+      }
+    } catch {}
+  }
+  $res += [PSCustomObject]@{ ProcessName = $p.ProcessName; MainWindowTitle = $p.MainWindowTitle; Labels = $labels }
+}
+$res | ConvertTo-Json -Compress -Depth 3
+"#;
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", ps])
         .output();
@@ -679,6 +710,15 @@ fn detect_windows_active_call(_self_label: Option<&str>) -> CallDetectionSnapsho
                     .get("MainWindowTitle")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let labels: Vec<String> = item
+                    .get("Labels")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if proc_name.eq_ignore_ascii_case("CptHost") {
                     return CallDetectionSnapshot {
                         active_call: Some(ActiveCallInfo {
@@ -693,7 +733,11 @@ fn detect_windows_active_call(_self_label: Option<&str>) -> CallDetectionSnapsho
                         status_note: None,
                     };
                 }
-                if let Some(call) = parse_call_from_window_title(proc_name, title) {
+                if let Some(mut call) = parse_call_from_window_title(proc_name, title) {
+                    let (participants, speaker) =
+                        extract_participants_and_speaker(&labels, self_label);
+                    call.participants = participants;
+                    call.active_speaker = speaker;
                     return CallDetectionSnapshot {
                         active_call: Some(call),
                         accessibility_granted: true,
@@ -712,28 +756,127 @@ fn detect_windows_active_call(_self_label: Option<&str>) -> CallDetectionSnapsho
 
 #[cfg(target_os = "linux")]
 fn detect_linux_active_call(_self_label: Option<&str>) -> CallDetectionSnapshot {
+    let mut windows: Vec<(String, String)> = Vec::new();
+
+    // 1. X11 via wmctrl
     if let Ok(o) = std::process::Command::new("wmctrl").arg("-l").output()
         && o.status.success()
     {
-        let raw = String::from_utf8_lossy(&o.stdout);
-        for line in raw.lines() {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
             let parts: Vec<&str> = line.splitn(4, char::is_whitespace).collect();
             if parts.len() == 4 {
-                let title = parts[3].trim();
-                if let Some(call) = parse_call_from_window_title("desktop", title) {
-                    return CallDetectionSnapshot {
-                        active_call: Some(call),
-                        accessibility_granted: true,
-                        status_note: None,
-                    };
+                windows.push(("desktop".to_string(), parts[3].trim().to_string()));
+            }
+        }
+    }
+
+    // 2. Wayland (Hyprland)
+    if windows.is_empty()
+        && let Ok(o) = std::process::Command::new("hyprctl")
+            .args(["clients", "-j"])
+            .output()
+        && o.status.success()
+        && let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&o.stdout)
+    {
+        for c in arr {
+            let cls = c.get("class").and_then(|v| v.as_str()).unwrap_or("desktop");
+            let title = c.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            if !title.is_empty() {
+                windows.push((cls.to_string(), title.to_string()));
+            }
+        }
+    }
+
+    // 3. Wayland (Sway)
+    if windows.is_empty()
+        && let Ok(o) = std::process::Command::new("swaymsg")
+            .args(["-t", "get_tree"])
+            .output()
+        && o.status.success()
+        && let Ok(tree) = serde_json::from_slice::<serde_json::Value>(&o.stdout)
+    {
+        collect_sway_windows(&tree, &mut windows);
+    }
+
+    // 4. X11 fallback via xdotool
+    if windows.is_empty()
+        && let Ok(o) = std::process::Command::new("xdotool")
+            .args(["search", "--onlyvisible", "--name", "."])
+            .output()
+        && o.status.success()
+    {
+        for wid in String::from_utf8_lossy(&o.stdout).lines().take(40) {
+            if let Ok(name_out) = std::process::Command::new("xdotool")
+                .args(["getwindowname", wid.trim()])
+                .output()
+                && name_out.status.success()
+            {
+                let title = String::from_utf8_lossy(&name_out.stdout).trim().to_string();
+                if !title.is_empty() {
+                    windows.push(("desktop".to_string(), title));
                 }
             }
         }
     }
+
+    for (app, title) in windows {
+        if let Some(call) = parse_call_from_window_title(&app, &title) {
+            return CallDetectionSnapshot {
+                active_call: Some(call),
+                accessibility_granted: true,
+                status_note: None,
+            };
+        }
+    }
+
+    // 5. /proc fallback for Zoom CptHost (only runs during an active Zoom call)
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let comm_path = entry.path().join("comm");
+            if let Ok(comm) = std::fs::read_to_string(comm_path)
+                && comm.trim().eq_ignore_ascii_case("CptHost")
+            {
+                return CallDetectionSnapshot {
+                    active_call: Some(ActiveCallInfo {
+                        provider: CallProvider::Zoom,
+                        app_name: "Zoom".to_string(),
+                        meeting_title: Some("Zoom Meeting".to_string()),
+                        participants: Vec::new(),
+                        active_speaker: None,
+                        detected_via: "proc:CptHost".to_string(),
+                    }),
+                    accessibility_granted: true,
+                    status_note: None,
+                };
+            }
+        }
+    }
+
     CallDetectionSnapshot {
         active_call: None,
         accessibility_granted: true,
         status_note: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_sway_windows(node: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    if let Some(name) = node.get("name").and_then(|v| v.as_str())
+        && !name.is_empty()
+        && node.get("app_id").is_some()
+    {
+        let app = node
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("desktop");
+        out.push((app.to_string(), name.to_string()));
+    }
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(arr) = node.get(key).and_then(|v| v.as_array()) {
+            for child in arr {
+                collect_sway_windows(child, out);
+            }
+        }
     }
 }
 
@@ -743,10 +886,21 @@ mod tests {
 
     #[test]
     fn parses_google_meet_zoom_teams_slack_discord_webex_and_facetime() {
-        let meet = parse_call_from_window_title("Google Chrome", "Meet - Architecture Review")
-            .unwrap();
+        let meet = parse_call_from_window_title(
+            "Google Chrome",
+            "Meet - Architecture Review - Google Chrome",
+        )
+        .unwrap();
         assert_eq!(meet.provider, CallProvider::GoogleMeet);
         assert_eq!(meet.meeting_title.as_deref(), Some("Architecture Review"));
+
+        let firefox_meet = parse_call_from_window_title(
+            "Firefox",
+            "Meet - Sprint Retro — Mozilla Firefox",
+        )
+        .unwrap();
+        assert_eq!(firefox_meet.provider, CallProvider::GoogleMeet);
+        assert_eq!(firefox_meet.meeting_title.as_deref(), Some("Sprint Retro"));
 
         let safari_meet = parse_call_from_window_title("Safari", "Google Meet - abc-defg-hij")
             .unwrap();
@@ -758,7 +912,7 @@ mod tests {
 
         let teams = parse_call_from_window_title(
             "Microsoft Teams",
-            "Weekly Sync | Microsoft Teams",
+            "Weekly Sync | Microsoft Teams - Microsoft Edge",
         )
         .unwrap();
         assert_eq!(teams.provider, CallProvider::MicrosoftTeams);
