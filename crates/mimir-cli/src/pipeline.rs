@@ -297,7 +297,9 @@ fn handle_chunk<A: AsrBackend>(
         words.iter().map(|w| w.probability).sum::<f32>() / words.len() as f32
     };
 
-    let speaker = diarizer.assign_speaker(chunk.channel, pooled_emb.as_deref());
+    let duration_ms = (chunk.samples.len() as u64 * 1000) / 16_000;
+    let speaker =
+        diarizer.assign_speaker_with_duration(chunk.channel, pooled_emb.as_deref(), duration_ms);
     let utterance = Utterance {
         id: Uuid::new_v4(),
         speaker_id: speaker.id.clone(),

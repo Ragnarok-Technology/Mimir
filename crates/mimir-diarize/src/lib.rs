@@ -28,7 +28,7 @@ impl Default for DiarizerConfig {
         Self {
             host_label: "Host".to_string(),
             diarize_mic: false,
-            similarity_threshold: 0.72,
+            similarity_threshold: 0.52,
             ghost_window_ms: 500,
             ghost_overlap_threshold: 0.65,
         }
@@ -56,6 +56,8 @@ pub struct Diarizer {
     host_info: SpeakerInfo,
     clusters: Vec<RemoteCluster>,
     mic_clusters: Vec<RemoteCluster>,
+    last_remote_speaker: Option<SpeakerInfo>,
+    last_mic_speaker: Option<SpeakerInfo>,
     next_remote_idx: usize,
     next_mic_idx: usize,
 }
@@ -91,6 +93,8 @@ impl Diarizer {
             host_info,
             clusters,
             mic_clusters: Vec::new(),
+            last_remote_speaker: None,
+            last_mic_speaker: None,
             next_remote_idx: 1,
             next_mic_idx: 1,
         }
@@ -102,15 +106,28 @@ impl Diarizer {
         channel: ChannelId,
         embedding: Option<&[f32]>,
     ) -> SpeakerInfo {
+        self.assign_speaker_with_duration(channel, embedding, 2_000)
+    }
+
+    /// Assigns a speaker for an utterance on `channel`, guarding against short segments (<1.2s)
+    /// spawning phantom new speaker clusters from noisy embeddings.
+    pub fn assign_speaker_with_duration(
+        &mut self,
+        channel: ChannelId,
+        embedding: Option<&[f32]>,
+        duration_ms: u64,
+    ) -> SpeakerInfo {
         if channel == ChannelId::Mic {
             if !self.config.diarize_mic {
                 return self.host_info.clone();
             }
-            return self.assign_mic_speaker(embedding);
+            return self.assign_mic_speaker(embedding, duration_ms);
         }
 
         let Some(norm_emb) = embedding.and_then(l2_normalize) else {
-            return self.fallback_remote_speaker();
+            let spk = self.fallback_remote_speaker();
+            self.last_remote_speaker = Some(spk.clone());
+            return spk;
         };
 
         let mut best_idx: Option<usize> = None;
@@ -131,9 +148,27 @@ impl Diarizer {
             && best_sim >= self.config.similarity_threshold
         {
             let cluster = &mut self.clusters[idx];
-            update_centroid(&mut cluster.centroid, cluster.count, &norm_emb);
-            cluster.count += 1;
-            return cluster.info.clone();
+            if duration_ms >= 1_200 {
+                update_centroid(&mut cluster.centroid, cluster.count, &norm_emb);
+                cluster.count += 1;
+            }
+            let spk = cluster.info.clone();
+            self.last_remote_speaker = Some(spk.clone());
+            return spk;
+        }
+
+        if duration_ms < 1_200 && !self.clusters.is_empty() {
+            let spk = if let Some(idx) = best_idx
+                && best_sim >= 0.30
+            {
+                self.clusters[idx].info.clone()
+            } else if let Some(ref last) = self.last_remote_speaker {
+                last.clone()
+            } else {
+                self.clusters[0].info.clone()
+            };
+            self.last_remote_speaker = Some(spk.clone());
+            return spk;
         }
 
         let speaker_num = self.next_remote_idx;
@@ -149,6 +184,7 @@ impl Diarizer {
             centroid: norm_emb,
             count: 1,
         });
+        self.last_remote_speaker = Some(info.clone());
         info
     }
 
@@ -185,9 +221,13 @@ impl Diarizer {
         map
     }
 
-    fn assign_mic_speaker(&mut self, embedding: Option<&[f32]>) -> SpeakerInfo {
+    fn assign_mic_speaker(&mut self, embedding: Option<&[f32]>, duration_ms: u64) -> SpeakerInfo {
         let Some(norm_emb) = embedding.and_then(l2_normalize) else {
-            return self.host_info.clone();
+            let spk = self
+                .last_mic_speaker
+                .clone()
+                .unwrap_or_else(|| self.host_info.clone());
+            return spk;
         };
 
         let mut best_idx: Option<usize> = None;
@@ -207,9 +247,27 @@ impl Diarizer {
             && best_sim >= self.config.similarity_threshold
         {
             let cluster = &mut self.mic_clusters[idx];
-            update_centroid(&mut cluster.centroid, cluster.count, &norm_emb);
-            cluster.count += 1;
-            return cluster.info.clone();
+            if duration_ms >= 1_200 {
+                update_centroid(&mut cluster.centroid, cluster.count, &norm_emb);
+                cluster.count += 1;
+            }
+            let spk = cluster.info.clone();
+            self.last_mic_speaker = Some(spk.clone());
+            return spk;
+        }
+
+        if duration_ms < 1_200 && !self.mic_clusters.is_empty() {
+            let spk = if let Some(idx) = best_idx
+                && best_sim >= 0.30
+            {
+                self.mic_clusters[idx].info.clone()
+            } else if let Some(ref last) = self.last_mic_speaker {
+                last.clone()
+            } else {
+                self.mic_clusters[0].info.clone()
+            };
+            self.last_mic_speaker = Some(spk.clone());
+            return spk;
         }
 
         let idx = self.next_mic_idx;
@@ -229,6 +287,7 @@ impl Diarizer {
             centroid: norm_emb,
             count: 1,
         });
+        self.last_mic_speaker = Some(info.clone());
         info
     }
 
@@ -467,5 +526,19 @@ mod tests {
         let expected = std::f32::consts::FRAC_1_SQRT_2;
         assert!((pooled[0] - expected).abs() < 1e-5);
         assert!((pooled[1] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn short_utterances_do_not_spawn_phantom_speakers() {
+        let cfg = DiarizerConfig {
+            diarize_mic: true,
+            ..Default::default()
+        };
+        let mut diarizer = Diarizer::new(cfg, vec![]);
+        let s1 = diarizer.assign_speaker_with_duration(ChannelId::Mic, Some(&[1.0, 0.0, 0.0]), 2500);
+        assert_eq!(s1.id, "host");
+        // Short 600ms snippet with noisy/orthogonal embedding must NOT create Local Speaker 2.
+        let short = diarizer.assign_speaker_with_duration(ChannelId::Mic, Some(&[0.0, 1.0, 0.0]), 600);
+        assert_eq!(short.id, "host");
     }
 }

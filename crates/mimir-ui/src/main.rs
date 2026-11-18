@@ -4,14 +4,17 @@ mod updater;
 
 use chrono::Utc;
 use eframe::egui;
-use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
+use mimir_audio::{BleedGate, SileroVadOnnx, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_core::calendar::{CalendarEvent, CalendarSourceStatus, open_url_in_system_browser};
 use mimir_core::{
     ActionItem, AudioRetention, CalDavAccount, ChannelId, KeywordPreset, MimirConfig, Session,
     Utterance,
 };
-use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
+use mimir_diarize::{
+    Diarizer, DiarizerConfig, OnnxSpeakerEmbedder, SpeakerEmbedder, insert_utterance_chronological,
+    mean_pool_frames,
+};
 use mimir_store::cleanup::{
     basic_heuristic_cleanup, build_qwen_cleanup_prompt_with_context, sanitize_cleanup_edit,
 };
@@ -24,7 +27,7 @@ use mimir_store::{
 use mimir_whistle::artifact::{
     delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model, fetch_silero_vad,
     fetch_speaker_embed, fetch_whistle_weights, model_statuses, resolve_lib_path,
-    resolve_qwen_paths, resolve_weights_path,
+    resolve_qwen_paths, resolve_silero_vad_path, resolve_speaker_embed_path, resolve_weights_path,
 };
 use mimir_whistle::qwen::QwenCleanupModel;
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
@@ -411,8 +414,25 @@ impl MimirDesktopApp {
                 let mut capture = start_dual_capture(audio_tx)?;
 
                 let mut bleed_gate = BleedGate::default_20ms();
-                let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
-                let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
+                let silero_path = resolve_silero_vad_path(&cfg);
+                let mut mic_vad = silero_path
+                    .exists()
+                    .then(|| SileroVadOnnx::load(&silero_path, 0.45).ok())
+                    .flatten()
+                    .map(|s| VadChunker::with_silero(ChannelId::Mic, 0.015, s))
+                    .unwrap_or_else(|| VadChunker::new(ChannelId::Mic, 0.015));
+                let mut sys_vad = silero_path
+                    .exists()
+                    .then(|| SileroVadOnnx::load(&silero_path, 0.45).ok())
+                    .flatten()
+                    .map(|s| VadChunker::with_silero(ChannelId::System, 0.012, s))
+                    .unwrap_or_else(|| VadChunker::new(ChannelId::System, 0.012));
+                let speaker_path = resolve_speaker_embed_path(&cfg);
+                let speaker_embedder = if speaker_path.is_file() {
+                    OnnxSpeakerEmbedder::load(&speaker_path).ok()
+                } else {
+                    None
+                };
                 let enrolled = store
                     .list_voiceprints()
                     .unwrap_or_default()
@@ -485,20 +505,29 @@ impl MimirDesktopApp {
                                     if trimmed.is_empty() {
                                         continue;
                                     }
-                                    let emb = engine.embed(&chunk.samples).ok().and_then(|v| {
-                                        if v.len() <= 512 {
-                                            Some(v)
-                                        } else {
-                                            mean_pool_frames(&v, 384).or(Some(v))
-                                        }
+                                    let onnx_emb = speaker_embedder
+                                        .as_ref()
+                                        .and_then(|s| s.embed(&chunk.samples).ok());
+                                    let emb = onnx_emb.or_else(|| {
+                                        engine.embed(&chunk.samples).ok().and_then(|v| {
+                                            if v.len() <= 512 {
+                                                Some(v)
+                                            } else {
+                                                mean_pool_frames(&v, 384).or(Some(v))
+                                            }
+                                        })
                                     });
                                     let words = res.into_word_tokens(chunk.start_ms);
-                                    let end_ms = words.last().map(|w| w.end_ms).unwrap_or(
-                                        chunk.start_ms
-                                            + (chunk.samples.len() as u64 * 1000 / 16_000),
+                                    let duration_ms = (chunk.samples.len() as u64 * 1000) / 16_000;
+                                    let end_ms = words
+                                        .last()
+                                        .map(|w| w.end_ms)
+                                        .unwrap_or(chunk.start_ms + duration_ms);
+                                    let spk = diarizer.assign_speaker_with_duration(
+                                        chunk.channel,
+                                        emb.as_deref(),
+                                        duration_ms,
                                     );
-                                    let spk =
-                                        diarizer.assign_speaker(chunk.channel, emb.as_deref());
                                     let utt = Utterance {
                                         id: Uuid::new_v4(),
                                         speaker_id: spk.id.clone(),
