@@ -68,6 +68,7 @@ enum UiEvent {
     Status(String),
     CleanupProgress(usize, usize),
     CleanupDone,
+    AutoTitleDone(Uuid, Option<String>),
     CalendarRefreshed(calendar_apps::CalendarRefreshResult),
     SessionFinished(Option<Uuid>),
     UpdateResult(UpdateStatus),
@@ -110,6 +111,7 @@ struct MimirDesktopApp {
     active_speaker_rename: Option<(String, String)>,
     status_line: String,
     cleanup_progress: Option<(usize, usize)>,
+    auto_titling_id: Option<Uuid>,
     calendar_events: Vec<CalendarEvent>,
     calendar_statuses: Vec<CalendarSourceStatus>,
     apple_calendar_status: Option<String>,
@@ -176,6 +178,7 @@ impl MimirDesktopApp {
             active_speaker_rename: None,
             status_line: "Ready · 100% Local · Zero Telemetry".to_string(),
             cleanup_progress: None,
+            auto_titling_id: None,
             calendar_events: Vec::new(),
             calendar_statuses: Vec::new(),
             apple_calendar_status: None,
@@ -610,7 +613,40 @@ impl MimirDesktopApp {
                             let _ = tx_ui.send(UiEvent::CleanupProgress(done, total));
                         },
                     );
+                    if cfg.auto_title_enabled {
+                        let _ = store.auto_title_session_with(
+                            session.id,
+                            false,
+                            &kws_for_opts,
+                            |sys, usr, max_tok| {
+                                if let Some(q) = qwen.as_mut() {
+                                    q.complete(sys, usr, max_tok).map(Some)
+                                } else {
+                                    Ok(None)
+                                }
+                            },
+                        );
+                    }
                     let _ = tx_ui.send(UiEvent::CleanupDone);
+                } else if cfg.auto_title_enabled {
+                    let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg);
+                    let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                        QwenCleanupModel::load(&qwen_w, &qwen_t).ok()
+                    } else {
+                        None
+                    };
+                    let _ = store.auto_title_session_with(
+                        session.id,
+                        false,
+                        &kws_for_opts,
+                        |sys, usr, max_tok| {
+                            if let Some(q) = qwen.as_mut() {
+                                q.complete(sys, usr, max_tok).map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    );
                 }
                 let _ = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg);
                 Ok(())
@@ -675,6 +711,50 @@ impl MimirDesktopApp {
         self.start_recording();
     }
 
+    fn run_auto_title_for_session(&mut self, id: Uuid, force: bool) {
+        if self.auto_titling_id.is_some() {
+            return;
+        }
+        self.auto_titling_id = Some(id);
+        self.status_line = "Generating concise session title…".into();
+        let cfg = self.cfg.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let title = (|| -> anyhow::Result<Option<String>> {
+                let store = SessionStore::open(&cfg.data_dir)?;
+                let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg);
+                let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                    QwenCleanupModel::load(&qwen_w, &qwen_t).ok()
+                } else {
+                    None
+                };
+                let t = store.auto_title_session_with(
+                    id,
+                    force,
+                    &cfg.keywords,
+                    |sys, usr, max_tok| {
+                        if let Some(q) = qwen.as_mut() {
+                            q.complete(sys, usr, max_tok).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )?;
+                let _ = sync_session_to_drop_dir_if_enabled(&store, id, &cfg);
+                Ok(t)
+            })();
+            match title {
+                Ok(t) => {
+                    let _ = tx.send(UiEvent::AutoTitleDone(id, t));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiEvent::Status(format!("Auto-title failed: {e}")));
+                    let _ = tx.send(UiEvent::AutoTitleDone(id, None));
+                }
+            }
+        });
+    }
+
     fn update_search_filter(&mut self) {
         let q = self.search_query.trim();
         if q.len() < 2 {
@@ -719,6 +799,20 @@ impl MimirDesktopApp {
                     self.cleanup_progress = None;
                     self.refresh_sessions();
                     if let Some(sid) = self.selected_session_id {
+                        self.load_session(sid);
+                    }
+                }
+                UiEvent::AutoTitleDone(sid, title) => {
+                    if self.auto_titling_id == Some(sid) {
+                        self.auto_titling_id = None;
+                    }
+                    if let Some(t) = title {
+                        self.status_line = format!("Auto-titled session: {t}");
+                    } else {
+                        self.status_line = "Could not infer a better title from transcript.".into();
+                    }
+                    self.refresh_sessions();
+                    if self.selected_session_id == Some(sid) {
                         self.load_session(sid);
                     }
                 }
@@ -1475,6 +1569,26 @@ impl MimirDesktopApp {
                             ctx.copy_text(self.selected_markdown.clone());
                             self.status_line = "Copied transcript Markdown to clipboard.".into();
                         }
+
+                        let titling = self.auto_titling_id == Some(sel_id);
+                        let title_btn_lbl = if titling { "Titling…" } else { "Auto-Title" };
+                        if ui
+                            .add_enabled(
+                                !titling && !self.selected_markdown.is_empty(),
+                                egui::Button::new(
+                                    egui::RichText::new(title_btn_lbl)
+                                        .size(11.5)
+                                        .color(palette::TEXT_PRIMARY),
+                                )
+                                .fill(palette::ELEVATED_BG)
+                                .stroke(egui::Stroke::new(1.0, palette::HAIRLINE))
+                                .corner_radius(egui::CornerRadius::same(7)),
+                            )
+                            .on_hover_text("Generate a concise topic title from this transcript")
+                            .clicked()
+                        {
+                            self.run_auto_title_for_session(sel_id, true);
+                        }
                     });
                 });
 
@@ -2012,6 +2126,17 @@ impl MimirDesktopApp {
                             &mut self.cfg.cleanup_enabled,
                             "Automatic transcript cleanup on stop",
                             Some("Run local heuristic & Qwen 2.5 0.5B cleanup automatically when capture finishes."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.cfg.auto_title_enabled,
+                            "Auto-title untitled sessions on stop",
+                            Some("Generate a concise topic title after recording (Qwen 2.5 0.5B if installed, else keyword fallback)."),
                             !self.is_recording,
                         )
                         .changed()

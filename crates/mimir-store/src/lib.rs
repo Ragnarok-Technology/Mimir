@@ -569,6 +569,63 @@ impl SessionStore {
         Ok(reverted)
     }
 
+    /// Generates and persists a concise topic title for `session_id` using the provided
+    /// `complete(system, user, max_new_tokens)` callback (e.g. `QwenCleanupModel::complete`),
+    /// falling back to a fast extractive title if Qwen returns nothing or fails guardrails.
+    /// When `force` is `false`, explicit/calendar titles are preserved untouched.
+    pub fn auto_title_session_with<F>(
+        &self,
+        session_id: Uuid,
+        force: bool,
+        extra_keywords: &[String],
+        mut complete: F,
+    ) -> Result<Option<String>>
+    where
+        F: FnMut(&str, &str, usize) -> Result<Option<String>>,
+    {
+        let Some(session) = self.get_session(session_id)? else {
+            return Err(MimirError::Storage(format!("session {session_id} not found")));
+        };
+        if !force && !cleanup::is_default_or_timestamped_title(session.title.as_deref()) {
+            return Ok(None);
+        }
+        if session.utterances.is_empty() {
+            return Ok(None);
+        }
+
+        let mut kws = session.keywords_used.clone();
+        for k in extra_keywords {
+            if !kws.iter().any(|existing| existing.eq_ignore_ascii_case(k)) {
+                kws.push(k.clone());
+            }
+        }
+
+        let excerpt = cleanup::select_salient_title_excerpt(&session.utterances, &kws, 800);
+        let (sys, usr) = cleanup::build_qwen_auto_title_prompt(&excerpt, &kws);
+        let qwen_title = complete(&sys, &usr, 16)
+            .ok()
+            .flatten()
+            .and_then(|cand| cleanup::sanitize_generated_title(&cand, &excerpt, &kws));
+
+        let final_title =
+            qwen_title.or_else(|| cleanup::extractive_fallback_title(&session.utterances, &kws));
+
+        if let Some(ref title) = final_title {
+            self.rename_session(session_id, title)?;
+        }
+        Ok(final_title)
+    }
+
+    /// Fast extractive auto-title without invoking an LLM.
+    pub fn auto_title_session_heuristic(
+        &self,
+        session_id: Uuid,
+        force: bool,
+        extra_keywords: &[String],
+    ) -> Result<Option<String>> {
+        self.auto_title_session_with(session_id, force, extra_keywords, |_, _, _| Ok(None))
+    }
+
     /// Permanently deletes a session, its utterances, FTS index entries, and JSONL WAL file.
     pub fn delete_session(&self, session_id: Uuid) -> Result<bool> {
         let id_str = session_id.to_string();

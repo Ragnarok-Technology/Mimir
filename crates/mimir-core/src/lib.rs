@@ -212,6 +212,10 @@ pub struct OAuthCalendarAccount {
 }
 
 /// Runtime configuration for Mimir.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MimirConfig {
@@ -229,6 +233,8 @@ pub struct MimirConfig {
     pub auto_detect_calls: bool,
     pub encrypt_at_rest: bool,
     pub cleanup_enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_title_enabled: bool,
     pub keyword_presets: Vec<KeywordPreset>,
     pub drop_sync_enabled: bool,
     pub calendar_ics_urls: Vec<String>,
@@ -256,6 +262,7 @@ impl Default for MimirConfig {
             auto_detect_calls: false,
             encrypt_at_rest: false,
             cleanup_enabled: false,
+            auto_title_enabled: true,
             keyword_presets: Vec::new(),
             drop_sync_enabled: false,
             calendar_ics_urls: Vec::new(),
