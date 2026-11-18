@@ -602,7 +602,7 @@ impl SessionStore {
 
         let excerpt = cleanup::select_salient_title_excerpt(&session.utterances, &kws, 800);
         let (sys, usr) = cleanup::build_qwen_auto_title_prompt(&excerpt, &kws);
-        let qwen_title = complete(&sys, &usr, 16)
+        let qwen_title = complete(&sys, &usr, 24)
             .ok()
             .flatten()
             .and_then(|cand| cleanup::sanitize_generated_title(&cand, &excerpt, &kws));

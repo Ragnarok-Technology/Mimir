@@ -249,7 +249,7 @@ pub fn select_salient_title_excerpt(
         .join("\n")
 }
 
-/// Builds a tiny single-pass prompt (for `max_new_tokens = 16`) to title a session.
+/// Builds a tiny single-pass prompt (for `max_new_tokens = 24`) to title a session.
 pub fn build_qwen_auto_title_prompt(excerpt: &str, keywords: &[String]) -> (String, String) {
     let kw_hint = if keywords.is_empty() {
         String::new()
@@ -257,19 +257,34 @@ pub fn build_qwen_auto_title_prompt(excerpt: &str, keywords: &[String]) -> (Stri
         format!(" Keywords: {}.", keywords.join(", "))
     };
     let system = format!(
-        "Generate a concise 2 to 6 word topic title for this transcript excerpt.{kw_hint} Output ONLY the plain title text with no quotes, no markdown, no labels, and no trailing punctuation."
+        "Write a concise 3 to 6 word noun-phrase title summarizing the topic of this transcript excerpt.{kw_hint} Output ONLY the plain title with no quotes, no markdown, no labels, and no trailing punctuation."
     );
     (system, excerpt.to_string())
 }
 
 fn is_stopword(w: &str) -> bool {
+    if w.contains('\'') || w.contains('’') {
+        return true;
+    }
     matches!(
         w,
         "the" | "and" | "for" | "that" | "this" | "with" | "from" | "have" | "will" | "what"
             | "when" | "where" | "which" | "about" | "into" | "your" | "they" | "them" | "their"
-            | "there" | "then" | "than" | "just" | "like" | "know" | "yeah" | "okay" | "right"
-            | "going" | "because" | "could" | "would" | "should" | "were" | "been" | "being"
-            | "some" | "more" | "very" | "much" | "also" | "only" | "here" | "now" | "well"
+            | "there" | "then" | "than" | "just" | "like" | "know" | "knew" | "yeah" | "okay"
+            | "right" | "going" | "gonna" | "wanna" | "because" | "could" | "would" | "should"
+            | "were" | "been" | "being" | "some" | "more" | "very" | "much" | "also" | "only"
+            | "here" | "now" | "well" | "never" | "always" | "ever" | "found" | "find" | "said"
+            | "says" | "told" | "tell" | "asked" | "think" | "thought" | "thing" | "things"
+            | "stuff" | "really" | "actually" | "maybe" | "probably" | "apparently" | "someone"
+            | "something" | "anything" | "everything" | "nothing" | "everyone" | "before"
+            | "after" | "around" | "through" | "other" | "these" | "those" | "while" | "still"
+            | "even" | "many" | "most" | "such" | "make" | "made" | "take" | "took" | "give"
+            | "gave" | "come" | "came" | "want" | "need" | "needs" | "mean" | "means" | "does"
+            | "done" | "doing" | "look" | "looks" | "touch" | "away" | "back" | "down" | "over"
+            | "under" | "again" | "next" | "good" | "bad" | "little" | "year" | "years"
+            | "month" | "months" | "days" | "page" | "notice" | "insists" | "decided"
+            | "instead" | "believe" | "hard" | "personal" | "reason" | "sure" | "complete"
+            | "freaking"
     )
 }
 
@@ -387,10 +402,12 @@ pub fn extractive_fallback_title(
     if terms.len() < 3 {
         let mut counts: std::collections::HashMap<String, (usize, usize, String)> =
             std::collections::HashMap::new();
+        let mut prev_clean: Option<(String, String)> = None;
         for (pos, raw_tok) in full.split_whitespace().enumerate() {
-            let clean = raw_tok.trim_matches(|c: char| !c.is_alphanumeric());
+            let clean = raw_tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’');
             let lower = clean.to_ascii_lowercase();
             if clean.len() < 4 || is_stopword(&lower) {
+                prev_clean = None;
                 continue;
             }
             let bonus = if clean.chars().next().is_some_and(char::is_uppercase) {
@@ -399,21 +416,45 @@ pub fn extractive_fallback_title(
                 1
             };
             counts
-                .entry(lower)
+                .entry(lower.clone())
                 .and_modify(|e| e.0 += bonus)
                 .or_insert((bonus, pos, clean.to_string()));
+
+            // Also score adjacent 2-word topical phrases (e.g. "essential oils", "air traffic").
+            if let Some((prev_lower, prev_disp)) = prev_clean.take()
+                && prev_lower != lower
+            {
+                let bigram_key = format!("{prev_lower} {lower}");
+                let bigram_disp = format!("{prev_disp} {clean}");
+                counts
+                    .entry(bigram_key)
+                    .and_modify(|e| e.0 += 3)
+                    .or_insert((3, pos.saturating_sub(1), bigram_disp));
+            }
+            prev_clean = Some((lower, clean.to_string()));
         }
         let mut ranked: Vec<(usize, usize, String)> = counts.into_values().collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         for (_, _, display) in ranked {
-            if !terms.iter().any(|t| t.eq_ignore_ascii_case(&display)) {
-                let mut chars = display.chars();
-                let titled = match chars.next() {
-                    Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
-                    None => display,
-                };
+            let disp_lower = display.to_ascii_lowercase();
+            let overlaps_existing = terms.iter().any(|t| {
+                let tl = t.to_ascii_lowercase();
+                tl == disp_lower || tl.contains(&disp_lower) || disp_lower.contains(&tl)
+            });
+            if !overlaps_existing {
+                let titled = display
+                    .split_whitespace()
+                    .map(|part| {
+                        let mut chars = part.chars();
+                        match chars.next() {
+                            Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 terms.push(titled);
-                if terms.len() >= 4 {
+                if terms.len() >= 3 {
                     break;
                 }
             }
@@ -421,7 +462,9 @@ pub fn extractive_fallback_title(
     }
 
     if terms.len() >= 2 {
-        Some(terms.join(" "))
+        Some(terms.join(" — "))
+    } else if terms.len() == 1 && terms[0].split_whitespace().count() >= 2 {
+        Some(terms.remove(0))
     } else {
         None
     }
