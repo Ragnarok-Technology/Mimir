@@ -1,6 +1,7 @@
 //! Core domain types, configuration, and errors shared across all Mimir crates.
 
 pub mod calendar;
+pub mod call_apps;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
