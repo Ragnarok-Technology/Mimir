@@ -4,14 +4,20 @@ mod updater;
 
 use chrono::Utc;
 use eframe::egui;
-use mimir_audio::{BleedGate, VadChunker, start_dual_capture};
+use mimir_audio::{BleedGate, SileroVadOnnx, VadChunker, start_dual_capture};
 use mimir_bridge::connect::connect_detected_assistants;
 use mimir_core::calendar::{CalendarEvent, CalendarSourceStatus, open_url_in_system_browser};
+use mimir_core::call_apps::{
+    ActiveCallInfo, CallDetectionSnapshot, detect_active_call, open_accessibility_settings,
+};
 use mimir_core::{
     ActionItem, AudioRetention, CalDavAccount, ChannelId, KeywordPreset, MimirConfig, Session,
     Utterance,
 };
-use mimir_diarize::{Diarizer, DiarizerConfig, insert_utterance_chronological, mean_pool_frames};
+use mimir_diarize::{
+    Diarizer, DiarizerConfig, OnnxSpeakerEmbedder, SpeakerEmbedder, insert_utterance_chronological,
+    mean_pool_frames,
+};
 use mimir_store::cleanup::{
     basic_heuristic_cleanup, build_qwen_cleanup_prompt_with_context, sanitize_cleanup_edit,
 };
@@ -24,7 +30,7 @@ use mimir_store::{
 use mimir_whistle::artifact::{
     delete_qwen_model, delete_silero_vad, delete_speaker_embed, fetch_qwen_model, fetch_silero_vad,
     fetch_speaker_embed, fetch_whistle_weights, model_statuses, resolve_lib_path,
-    resolve_qwen_paths, resolve_weights_path,
+    resolve_qwen_paths, resolve_silero_vad_path, resolve_speaker_embed_path, resolve_weights_path,
 };
 use mimir_whistle::qwen::QwenCleanupModel;
 use mimir_whistle::{TranscribeOptions, WhistleEngine};
@@ -68,6 +74,8 @@ enum UiEvent {
     Status(String),
     CleanupProgress(usize, usize),
     CleanupDone,
+    AutoTitleDone(Uuid, Option<String>),
+    CallDetected(CallDetectionSnapshot),
     CalendarRefreshed(calendar_apps::CalendarRefreshResult),
     SessionFinished(Option<Uuid>),
     UpdateResult(UpdateStatus),
@@ -110,6 +118,7 @@ struct MimirDesktopApp {
     active_speaker_rename: Option<(String, String)>,
     status_line: String,
     cleanup_progress: Option<(usize, usize)>,
+    auto_titling_id: Option<Uuid>,
     calendar_events: Vec<CalendarEvent>,
     calendar_statuses: Vec<CalendarSourceStatus>,
     apple_calendar_status: Option<String>,
@@ -122,6 +131,13 @@ struct MimirDesktopApp {
     last_calendar_poll: std::time::Instant,
     last_store_poll: std::time::Instant,
     last_db_stamp: Option<std::time::SystemTime>,
+    active_call: Option<ActiveCallInfo>,
+    call_accessibility_granted: bool,
+    call_status_note: Option<String>,
+    last_call_poll: std::time::Instant,
+    call_poll_in_flight: bool,
+    last_auto_detected_call_key: Option<String>,
+    active_call_hint: Arc<std::sync::Mutex<Option<ActiveCallInfo>>>,
     pending_calendar_meta: Option<(String, Option<String>, Vec<String>)>,
     connect_report: String,
     update_line: String,
@@ -176,6 +192,7 @@ impl MimirDesktopApp {
             active_speaker_rename: None,
             status_line: "Ready · 100% Local · Zero Telemetry".to_string(),
             cleanup_progress: None,
+            auto_titling_id: None,
             calendar_events: Vec::new(),
             calendar_statuses: Vec::new(),
             apple_calendar_status: None,
@@ -188,6 +205,13 @@ impl MimirDesktopApp {
             last_calendar_poll: std::time::Instant::now(),
             last_store_poll: std::time::Instant::now(),
             last_db_stamp: initial_db_stamp,
+            active_call: None,
+            call_accessibility_granted: false,
+            call_status_note: None,
+            last_call_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            call_poll_in_flight: false,
+            last_auto_detected_call_key: None,
+            active_call_hint: Arc::new(std::sync::Mutex::new(None)),
             pending_calendar_meta: None,
             connect_report: String::new(),
             update_line: String::new(),
@@ -379,6 +403,7 @@ impl MimirDesktopApp {
         let mic_level = self.mic_level.clone();
         let sys_level = self.sys_level.clone();
         let tx_ui = self.event_tx.clone();
+        let active_call_hint = Arc::clone(&self.active_call_hint);
         let cal_meta = self.pending_calendar_meta.take();
 
         let kws_for_opts = keywords.clone();
@@ -408,8 +433,25 @@ impl MimirDesktopApp {
                 let mut capture = start_dual_capture(audio_tx)?;
 
                 let mut bleed_gate = BleedGate::default_20ms();
-                let mut mic_vad = VadChunker::new(ChannelId::Mic, 0.015);
-                let mut sys_vad = VadChunker::new(ChannelId::System, 0.012);
+                let silero_path = resolve_silero_vad_path(&cfg);
+                let mut mic_vad = silero_path
+                    .exists()
+                    .then(|| SileroVadOnnx::load(&silero_path, 0.45).ok())
+                    .flatten()
+                    .map(|s| VadChunker::with_silero(ChannelId::Mic, 0.015, s))
+                    .unwrap_or_else(|| VadChunker::new(ChannelId::Mic, 0.015));
+                let mut sys_vad = silero_path
+                    .exists()
+                    .then(|| SileroVadOnnx::load(&silero_path, 0.45).ok())
+                    .flatten()
+                    .map(|s| VadChunker::with_silero(ChannelId::System, 0.012, s))
+                    .unwrap_or_else(|| VadChunker::new(ChannelId::System, 0.012));
+                let speaker_path = resolve_speaker_embed_path(&cfg);
+                let speaker_embedder = if speaker_path.is_file() {
+                    OnnxSpeakerEmbedder::load(&speaker_path).ok()
+                } else {
+                    None
+                };
                 let enrolled = store
                     .list_voiceprints()
                     .unwrap_or_default()
@@ -482,20 +524,49 @@ impl MimirDesktopApp {
                                     if trimmed.is_empty() {
                                         continue;
                                     }
-                                    let emb = engine.embed(&chunk.samples).ok().and_then(|v| {
-                                        if v.len() <= 512 {
-                                            Some(v)
-                                        } else {
-                                            mean_pool_frames(&v, 384).or(Some(v))
-                                        }
+                                    let onnx_emb = speaker_embedder
+                                        .as_ref()
+                                        .and_then(|s| s.embed(&chunk.samples).ok());
+                                    let emb = onnx_emb.or_else(|| {
+                                        engine.embed(&chunk.samples).ok().and_then(|v| {
+                                            if v.len() <= 512 {
+                                                Some(v)
+                                            } else {
+                                                mean_pool_frames(&v, 384).or(Some(v))
+                                            }
+                                        })
                                     });
                                     let words = res.into_word_tokens(chunk.start_ms);
-                                    let end_ms = words.last().map(|w| w.end_ms).unwrap_or(
-                                        chunk.start_ms
-                                            + (chunk.samples.len() as u64 * 1000 / 16_000),
+                                    let duration_ms = (chunk.samples.len() as u64 * 1000) / 16_000;
+                                    let end_ms = words
+                                        .last()
+                                        .map(|w| w.end_ms)
+                                        .unwrap_or(chunk.start_ms + duration_ms);
+                                    let mut spk = diarizer.assign_speaker_with_duration(
+                                        chunk.channel,
+                                        emb.as_deref(),
+                                        duration_ms,
                                     );
-                                    let spk =
-                                        diarizer.assign_speaker(chunk.channel, emb.as_deref());
+                                    if chunk.channel == ChannelId::System
+                                        && spk.label.starts_with("Speaker ")
+                                        && let Ok(guard) = active_call_hint.lock()
+                                        && let Some(ref call) = *guard
+                                    {
+                                        let hint_name = call.active_speaker.as_deref().or_else(|| {
+                                            (call.participants.len() == 1)
+                                                .then(|| call.participants[0].as_str())
+                                        });
+                                        if let Some(name) = hint_name
+                                            && !diarizer
+                                                .speakers_map()
+                                                .values()
+                                                .any(|s| s.label.eq_ignore_ascii_case(name))
+                                        {
+                                            diarizer.rename_speaker(&spk.id, name);
+                                            let _ = store.rename_speaker(session.id, &spk.id, name);
+                                            spk.label = name.to_string();
+                                        }
+                                    }
                                     let utt = Utterance {
                                         id: Uuid::new_v4(),
                                         speaker_id: spk.id.clone(),
@@ -610,7 +681,40 @@ impl MimirDesktopApp {
                             let _ = tx_ui.send(UiEvent::CleanupProgress(done, total));
                         },
                     );
+                    if cfg.auto_title_enabled {
+                        let _ = store.auto_title_session_with(
+                            session.id,
+                            false,
+                            &kws_for_opts,
+                            |sys, usr, max_tok| {
+                                if let Some(q) = qwen.as_mut() {
+                                    q.complete(sys, usr, max_tok).map(Some)
+                                } else {
+                                    Ok(None)
+                                }
+                            },
+                        );
+                    }
                     let _ = tx_ui.send(UiEvent::CleanupDone);
+                } else if cfg.auto_title_enabled {
+                    let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg);
+                    let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                        QwenCleanupModel::load(&qwen_w, &qwen_t).ok()
+                    } else {
+                        None
+                    };
+                    let _ = store.auto_title_session_with(
+                        session.id,
+                        false,
+                        &kws_for_opts,
+                        |sys, usr, max_tok| {
+                            if let Some(q) = qwen.as_mut() {
+                                q.complete(sys, usr, max_tok).map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    );
                 }
                 let _ = sync_session_to_drop_dir_if_enabled(&store, session.id, &cfg);
                 Ok(())
@@ -647,6 +751,46 @@ impl MimirDesktopApp {
         });
     }
 
+    fn refresh_active_call_async(&mut self) {
+        if self.call_poll_in_flight {
+            return;
+        }
+        self.call_poll_in_flight = true;
+        let host_label = self.cfg.host_label.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let snap = detect_active_call(Some(&host_label));
+            let _ = tx.send(UiEvent::CallDetected(snap));
+        });
+    }
+
+    fn start_recording_for_active_call(&mut self, call: &ActiveCallInfo) {
+        if self.is_recording {
+            return;
+        }
+        if self.session_title.trim().is_empty() {
+            self.session_title = call
+                .meeting_title
+                .clone()
+                .unwrap_or_else(|| format!("{} Call", call.provider.display_name()));
+        }
+        if !call.participants.is_empty() {
+            let mut kw_parts: Vec<String> = self
+                .keywords_input
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for p in &call.participants {
+                if !kw_parts.iter().any(|k| k.eq_ignore_ascii_case(p)) {
+                    kw_parts.push(p.clone());
+                }
+            }
+            self.keywords_input = kw_parts.join(", ");
+        }
+        self.start_recording();
+    }
+
     fn join_and_record_event(&mut self, ev: &CalendarEvent, open_url: bool) {
         if open_url
             && let Some(ref url) = ev.meeting_url
@@ -673,6 +817,50 @@ impl MimirDesktopApp {
             ev.attendees.clone(),
         ));
         self.start_recording();
+    }
+
+    fn run_auto_title_for_session(&mut self, id: Uuid, force: bool) {
+        if self.auto_titling_id.is_some() {
+            return;
+        }
+        self.auto_titling_id = Some(id);
+        self.status_line = "Generating concise session title…".into();
+        let cfg = self.cfg.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let title = (|| -> anyhow::Result<Option<String>> {
+                let store = SessionStore::open(&cfg.data_dir)?;
+                let (qwen_w, qwen_t) = resolve_qwen_paths(&cfg);
+                let mut qwen = if qwen_w.is_file() && qwen_t.is_file() {
+                    QwenCleanupModel::load(&qwen_w, &qwen_t).ok()
+                } else {
+                    None
+                };
+                let t = store.auto_title_session_with(
+                    id,
+                    force,
+                    &cfg.keywords,
+                    |sys, usr, max_tok| {
+                        if let Some(q) = qwen.as_mut() {
+                            q.complete(sys, usr, max_tok).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )?;
+                let _ = sync_session_to_drop_dir_if_enabled(&store, id, &cfg);
+                Ok(t)
+            })();
+            match title {
+                Ok(t) => {
+                    let _ = tx.send(UiEvent::AutoTitleDone(id, t));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiEvent::Status(format!("Auto-title failed: {e}")));
+                    let _ = tx.send(UiEvent::AutoTitleDone(id, None));
+                }
+            }
+        });
     }
 
     fn update_search_filter(&mut self) {
@@ -720,6 +908,49 @@ impl MimirDesktopApp {
                     self.refresh_sessions();
                     if let Some(sid) = self.selected_session_id {
                         self.load_session(sid);
+                    }
+                }
+                UiEvent::AutoTitleDone(sid, title) => {
+                    if self.auto_titling_id == Some(sid) {
+                        self.auto_titling_id = None;
+                    }
+                    if let Some(t) = title {
+                        self.status_line = format!("Auto-titled session: {t}");
+                    } else {
+                        self.status_line = "Could not infer a better title from transcript.".into();
+                    }
+                    self.refresh_sessions();
+                    if self.selected_session_id == Some(sid) {
+                        self.load_session(sid);
+                    }
+                }
+                UiEvent::CallDetected(snap) => {
+                    self.call_poll_in_flight = false;
+                    self.call_accessibility_granted = snap.accessibility_granted;
+                    self.call_status_note = snap.status_note.clone();
+                    if let Ok(mut guard) = self.active_call_hint.lock() {
+                        *guard = snap.active_call.clone();
+                    }
+                    self.active_call = snap.active_call.clone();
+                    if let Some(ref call) = snap.active_call {
+                        let key = format!(
+                            "{:?}:{}",
+                            call.provider,
+                            call.meeting_title.as_deref().unwrap_or("")
+                        );
+                        if self.cfg.auto_detect_calls
+                            && !self.is_recording
+                            && self.last_auto_detected_call_key.as_deref() != Some(&key)
+                        {
+                            self.last_auto_detected_call_key = Some(key);
+                            self.status_line = format!(
+                                "Detected {} call — starting local capture…",
+                                call.provider.display_name()
+                            );
+                            self.start_recording_for_active_call(call);
+                        }
+                    } else {
+                        self.last_auto_detected_call_key = None;
                     }
                 }
                 UiEvent::CalendarRefreshed(res) => {
@@ -1145,6 +1376,70 @@ impl MimirDesktopApp {
         let text_primary = palette::TEXT_PRIMARY;
         let text_muted = palette::TEXT_MUTED;
 
+        // 0. Active Call Detected Banner (Zoom, Meet, Teams, Slack, Discord, FaceTime, Webex)
+        if let Some(call) = self.active_call.clone() {
+            egui::Frame::new()
+                .fill(palette::ACTIVE_FILL)
+                .stroke(egui::Stroke::new(1.0_f32, ice))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                badge_pill(
+                                    ui,
+                                    call.provider.display_name(),
+                                    ice,
+                                    palette::VOID_BG,
+                                );
+                                badge_pill(ui, "ACTIVE CALL", cyan, palette::VOID_BG);
+                            });
+                            ui.add_space(4.0);
+                            let title = call
+                                .meeting_title
+                                .as_deref()
+                                .unwrap_or("Call in progress");
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .strong()
+                                    .size(14.5)
+                                    .color(text_primary),
+                            );
+                            if !call.participants.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Participants: {}",
+                                        call.participants.join(", ")
+                                    ))
+                                    .size(12.0)
+                                    .color(palette::TEXT_SECONDARY),
+                                );
+                            } else if let Some(ref note) = self.call_status_note {
+                                ui.label(
+                                    egui::RichText::new(note)
+                                        .size(11.5)
+                                        .color(text_muted),
+                                );
+                            }
+                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if !self.is_recording
+                                    && action_button(ui, "Record Call", ButtonVariant::Primary)
+                                        .clicked()
+                                {
+                                    self.start_recording_for_active_call(&call);
+                                }
+                            },
+                        );
+                    });
+                });
+            ui.add_space(10.0);
+        }
+
         // 1. Upcoming Calendar Meeting Banner (when idle and a meeting is within window)
         if !self.is_recording && !self.calendar_events.is_empty() {
             let events_snapshot = self.calendar_events.clone();
@@ -1474,6 +1769,26 @@ impl MimirDesktopApp {
                         {
                             ctx.copy_text(self.selected_markdown.clone());
                             self.status_line = "Copied transcript Markdown to clipboard.".into();
+                        }
+
+                        let titling = self.auto_titling_id == Some(sel_id);
+                        let title_btn_lbl = if titling { "Titling…" } else { "Auto-Title" };
+                        if ui
+                            .add_enabled(
+                                !titling && !self.selected_markdown.is_empty(),
+                                egui::Button::new(
+                                    egui::RichText::new(title_btn_lbl)
+                                        .size(11.5)
+                                        .color(palette::TEXT_PRIMARY),
+                                )
+                                .fill(palette::ELEVATED_BG)
+                                .stroke(egui::Stroke::new(1.0, palette::HAIRLINE))
+                                .corner_radius(egui::CornerRadius::same(7)),
+                            )
+                            .on_hover_text("Generate a concise topic title from this transcript")
+                            .clicked()
+                        {
+                            self.run_auto_title_for_session(sel_id, true);
                         }
                     });
                 });
@@ -2017,6 +2332,51 @@ impl MimirDesktopApp {
                         .changed()
                         {
                             let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.cfg.auto_title_enabled,
+                            "Auto-title untitled sessions on stop",
+                            Some("Generate a concise topic title after recording (Qwen 2.5 0.5B if installed, else keyword fallback)."),
+                            !self.is_recording,
+                        )
+                        .changed()
+                        {
+                            let _ = self.cfg.save();
+                        }
+                        if toggle_switch(
+                            ui,
+                            &mut self.cfg.auto_detect_calls,
+                            "Auto-detect active calls (Zoom, Meet, Teams, Slack, Discord, FaceTime, Webex)",
+                            Some("Watch local OS windows/browsers for active calls, prefill participants, and start recording automatically."),
+                            true,
+                        )
+                        .changed()
+                        {
+                            let _ = self.cfg.save();
+                            self.refresh_active_call_async();
+                        }
+                        #[cfg(target_os = "macos")]
+                        if !self.call_accessibility_granted {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Accessibility permission enables reading participant & active-speaker names from Zoom/Teams/Slack/FaceTime windows.",
+                                    )
+                                    .size(11.5)
+                                    .color(text_muted),
+                                );
+                                if action_button(
+                                    ui,
+                                    "Grant Accessibility",
+                                    ButtonVariant::Secondary,
+                                )
+                                .clicked()
+                                {
+                                    open_accessibility_settings();
+                                }
+                            });
                         }
                         if toggle_switch(
                             ui,
@@ -2814,6 +3174,13 @@ impl eframe::App for MimirDesktopApp {
         {
             ctx.copy_text(self.selected_markdown.clone());
             self.status_line = "Copied transcript to clipboard.".into();
+        }
+
+        if (self.is_recording || self.cfg.auto_detect_calls || self.mode == WorkspaceMode::Capture)
+            && self.last_call_poll.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            self.last_call_poll = std::time::Instant::now();
+            self.refresh_active_call_async();
         }
 
         if self.is_recording {

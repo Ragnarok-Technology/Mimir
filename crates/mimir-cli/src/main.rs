@@ -118,6 +118,16 @@ enum Commands {
         #[command(subcommand)]
         action: PresetsAction,
     },
+    /// Generate a concise topic title for a session (Qwen 2.5 0.5B if installed + extractive fallback).
+    Title {
+        /// Session UUID (defaults to latest session if omitted).
+        session_id: Option<String>,
+        /// Overwrite an existing non-default title.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Start live dual-channel meeting/conversation capture and transcription.
     Start {
         #[arg(long)]
@@ -390,7 +400,7 @@ async fn main() -> Result<()> {
             json,
             progress,
         } => {
-            let (updated, used_qwen) = run_session_cleanup(&cfg, session_id, progress)?;
+            let (updated, used_qwen, _) = run_session_cleanup_inner(&cfg, session_id, progress, false)?;
             let store = SessionStore::open(&cfg.data_dir)?;
             let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store, session_id, &cfg);
             if json {
@@ -409,6 +419,35 @@ async fn main() -> Result<()> {
                     updated,
                     if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
                 );
+            }
+        }
+        Commands::Title {
+            session_id,
+            force,
+            json,
+        } => {
+            let store = SessionStore::open(&cfg.data_dir)?;
+            let target_id = match session_id {
+                Some(raw) if raw != "latest" => Uuid::parse_str(&raw)?,
+                _ => store
+                    .latest_session()?
+                    .map(|s| s.id)
+                    .context("no transcription sessions found")?,
+            };
+            let title = run_session_auto_title(&cfg, &store, target_id, force, None)?;
+            let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store, target_id, &cfg);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "session_id": target_id,
+                        "title": title,
+                    }))?
+                );
+            } else if let Some(t) = title {
+                println!("Titled session {target_id}: {t}");
+            } else {
+                println!("Session {target_id} kept its existing title.");
             }
         }
         Commands::Presets { action } => {
@@ -615,13 +654,22 @@ async fn main() -> Result<()> {
 
             let _ = std::fs::remove_file(&pid_path);
             if enable_cleanup {
-                let (updated, used_qwen) = run_session_cleanup(&cfg, session_id, false)?;
+                let (updated, used_qwen, auto_titled) =
+                    run_session_cleanup_inner(&cfg, session_id, false, cfg.auto_title_enabled)?;
                 eprintln!(
                     "Post-processed session {} ({} utterance(s) updated, engine: {}).",
                     session_id,
                     updated,
                     if used_qwen { "Qwen 2.5 0.5B" } else { "heuristics" }
                 );
+                if let Some(t) = auto_titled {
+                    eprintln!("Auto-titled session {session_id}: {t}");
+                }
+            } else if cfg.auto_title_enabled
+                && let Ok(store_after) = SessionStore::open(&cfg.data_dir)
+                && let Ok(Some(t)) = run_session_auto_title(&cfg, &store_after, session_id, false, None)
+            {
+                eprintln!("Auto-titled session {session_id}: {t}");
             }
             if let Ok(store_after) = SessionStore::open(&cfg.data_dir) {
                 let _ = mimir_store::sync_session_to_drop_dir_if_enabled(&store_after, session_id, &cfg);
@@ -883,11 +931,40 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_session_cleanup(
+fn run_session_auto_title(
+    cfg: &MimirConfig,
+    store: &SessionStore,
+    session_id: Uuid,
+    force: bool,
+    loaded_qwen: Option<&mut QwenCleanupModel>,
+) -> Result<Option<String>> {
+    let mut owned_qwen = None;
+    let qwen_ref = if let Some(q) = loaded_qwen {
+        Some(q)
+    } else {
+        let (qwen_weights, qwen_tok) = resolve_qwen_paths(cfg);
+        if qwen_weights.is_file() && qwen_tok.is_file() {
+            owned_qwen = QwenCleanupModel::load(&qwen_weights, &qwen_tok).ok();
+        }
+        owned_qwen.as_mut()
+    };
+    let mut qwen_opt = qwen_ref;
+    let title = store.auto_title_session_with(session_id, force, &cfg.keywords, |sys, usr, max_tok| {
+        if let Some(q) = qwen_opt.as_deref_mut() {
+            q.complete(sys, usr, max_tok).map(Some)
+        } else {
+            Ok(None)
+        }
+    })?;
+    Ok(title)
+}
+
+fn run_session_cleanup_inner(
     cfg: &MimirConfig,
     session_id: Uuid,
     emit_progress: bool,
-) -> Result<(usize, bool)> {
+    also_auto_title: bool,
+) -> Result<(usize, bool, Option<String>)> {
     let store = SessionStore::open(&cfg.data_dir)?;
     let Some(session) = store.get_session(session_id)? else {
         anyhow::bail!("session {session_id} not found");
@@ -927,5 +1004,12 @@ fn run_session_cleanup(
             }
         },
     )?;
-    Ok((updated, used_qwen))
+    let auto_titled = if also_auto_title {
+        run_session_auto_title(cfg, &store, session_id, false, qwen_model.as_mut())
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    Ok((updated, used_qwen, auto_titled))
 }
